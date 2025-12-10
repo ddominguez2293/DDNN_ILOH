@@ -1,0 +1,169 @@
+---
+title: "Catchments"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+source("SRC/Functions_Paths.R")
+```
+
+
+```{r}
+# Load area of interest (Illinois River basin)
+aoi <- st_read(basin_shp, quiet = TRUE) %>%
+  st_transform(4326)  # WGS84 for NLDI
+
+```
+
+```{r}
+# Get nhd flowlines 
+flowlines <- get_nhdplus(AOI = aoi, realization = "flowline")
+
+# Keep only essential attributes
+flowlines <- flowlines %>%
+  select(comid, reachcode, gnis_name, lengthkm, areasqkm, slope,
+         streamorde, streamcalc, hydroseq, levelpathi,
+         fromnode, tonode, terminalfl, startflag, divergence, geometry)
+
+```
+
+```{r}
+# Get Catchments
+catchments <- get_nhdplus(AOI = aoi, realization = "catchment")
+
+# Keep only comid + area
+catchments <- catchments%>%
+  rename(comid = featureid) %>%      # match flowlines naming
+  select(comid, areasqkm, geometry)  # keep only needed field)
+
+```
+
+```{r}
+
+# Check for orphan edges (no fromnode/tonode connection)
+orphan_comids <- flowlines %>%
+  filter(is.na(fromnode) | is.na(tonode)) %>%
+  pull(comid)
+
+if (length(orphan_comids) > 0) {
+  warning("Orphan COMIDs found: ", paste(orphan_comids, collapse = ", "))
+} else {
+  message("All COMIDs routable (no orphan edges).")
+}
+
+```
+
+```{r}
+# Save outputs
+
+flowline_out   <- file.path(nhd_dir, "flowlines.gpkg")
+catchment_out  <- file.path(nhd_dir, "catchments.gpkg")
+daily_drivers_out <- file.path(daily_drivers_dir, "drivers_daily.feather")
+
+# Remove old files if exist
+if (file.exists(flowline_out)) file.remove(flowline_out)
+if (file.exists(catchment_out)) file.remove(catchment_out)
+
+st_write(flowlines, flowline_out, quiet = TRUE)
+st_write(catchments, catchment_out, quiet = TRUE)
+
+```
+
+```{r}
+# Get candidate USGS sites within AOI with Q, T, Chl-a
+
+# AOI
+bbox <- st_bbox(aoi)
+
+site_data <- whatNWISdata(
+  bBox = c(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"]),
+  service = "dv",
+  parameterCd = c("00060", "00010", "32316", "32319")
+)
+
+# Make unique site dataset with metadata
+sites_sf <- site_data %>%
+  filter(!is.na(dec_lat_va), !is.na(dec_long_va)) %>%
+  distinct(site_no, .keep_all = TRUE) %>%   # Keep one record per site
+  st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4326)
+
+```
+
+```{r}
+# snap sites to nearest flowline
+
+# Load flowlines from the file we just created
+flowlines <- st_read(flowline_out, quiet = TRUE)
+
+# Search radius in meters; increase if some sites don't snap
+search_radius <- 100
+
+
+# Add VAA attributes to flowlines before snapping
+vaa <- get_vaa() %>%
+  select(comid, frommeas, tomeas)
+
+# Join to flowlines, rename to what get_flowline_index expects
+flowlines <- flowlines %>%
+  left_join(vaa, by = "comid") %>%
+  rename(FromMeas = frommeas, ToMeas = tomeas)
+
+# Now run snapping
+site_matches <- get_flowline_index(
+  flowlines,
+  sites_sf,
+  search_radius = search_radius
+)
+
+# Add COMID to sites dataset
+sites_with_comid <- sites_sf %>%
+  mutate(COMID = site_matches$COMID)
+
+unsnapped <- sites_with_comid %>% filter(is.na(COMID))
+
+if (nrow(unsnapped) > 0) {
+  warning("Some sites were not snapped to a COMID: ",
+          paste(unsnapped$site_no, collapse = ", "))
+} else {
+  message("All sites successfully snapped to COMIDs!")
+}
+
+
+sites_out <- file.path(shape_dir, "sites_with_comid.shp")
+
+if (file.exists(sites_out)) file.remove(sites_out)
+
+st_write(sites_with_comid, sites_out, quiet = TRUE)
+
+```
+
+```{r}
+# use all catchment COMIDs instead of just site COMIDs
+comids <- sort(unique(na.omit(catchments$comid)))
+if (!length(comids)) stop("No COMIDs available for basin delineation.")
+
+
+# fetch & bind
+basins <- purrr::map_dfr(comids, function(cid) {
+  res <- get_basin_safe(cid)
+  # tiny pause to be polite to the service; adjust as needed
+  Sys.sleep(0.15)
+  res
+}) %>%
+  st_transform(st_crs(aoi)) %>%
+  st_make_valid()
+
+if (nrow(basins)) {
+  basins_out <- file.path(shape_dir, "site_upstream_basins.gpkg")
+  if (file.exists(basins_out)) file.remove(basins_out)
+  st_write(basins, basins_out, quiet = TRUE)
+  message("Wrote full upstream basins: ", basins_out,
+          " (", length(unique(basins$COMID)), " / ", length(comids), " COMIDs)")
+} else {
+  warning("NLDI returned no basins for the requested COMIDs.")
+}
+```
+
+

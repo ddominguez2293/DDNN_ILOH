@@ -1,0 +1,88 @@
+---
+title: "Streamflow"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, message=TRUE, warning=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Shared paths, packages, helper functions
+source("SRC/Functions_Paths.R")
+
+```
+
+```{r}
+# load sites with comid
+sites_with_comid <- st_read(sites_path, quiet = TRUE)
+
+site_ids <- unique(sites_with_comid$site_no)
+
+```
+
+```{r}
+# -------------------------------
+# 2. Pull Daily Streamflow (00060)
+# -------------------------------
+start_date <- "2013-01-01"
+end_date   <- "2025-09-10"
+
+q_raw <- readNWISdv(
+  siteNumbers = site_ids,
+  parameterCd = "00060",  # streamflow
+  startDate = start_date,
+  endDate = end_date
+)
+```
+
+```{r}
+# Convert to standard names
+q_clean <- renameNWISColumns(q_raw)
+
+# -------------------------------
+# 3. Convert cfs → m³/s
+# -------------------------------
+q_clean <- q_clean %>%
+  mutate(
+    q_m3s = Flow * 0.0283168  # 1 cfs = 0.0283168 m³/s
+  )
+
+```
+
+```{r}
+# Join to COMID's
+q_comid <- q_clean %>%
+  left_join(
+    sites_with_comid %>% st_drop_geometry() %>% select(site_no, COMID),
+    by = c("site_no" = "site_no")
+  ) %>%
+  rename(comid = COMID)
+
+```
+
+```{r}
+# save to parquet (large file)
+q_out <- file.path(daily_drivers_dir, "q_obs.parquet")
+write_parquet(q_comid, q_out)
+
+```
+
+
+```{r}
+# QC plots
+# Missingness by site
+ggplot(q_comid, aes(x = Date, y = site_no)) +
+  geom_tile(aes(fill = is.na(q_m3s))) +
+  scale_fill_manual(values = c("TRUE"="red","FALSE"="white")) +
+  labs(title="Missing Streamflow Data", x="Date", y="Site")
+
+# Distribution check (unit sanity)
+ggplot(q_comid, aes(x = q_m3s)) +
+  geom_histogram(bins = 50, fill="skyblue", color="black") +
+  labs(title="Streamflow Distribution (m³/s)", x="Flow (m³/s)", y="Count") +
+  xlim(0, quantile(q_comid$q_m3s, 0.99, na.rm=TRUE))
+
+```
+

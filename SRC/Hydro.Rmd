@@ -1,0 +1,97 @@
+---
+title: "Hydro"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=TRUE, warning=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Shared paths, packages, helper functions
+source("SRC/Functions_Paths.R")
+
+```
+
+```{r}
+# Load merged climate vars with PET
+drivers_daily <- read_feather(daily_drivers_out)
+
+```
+
+```{r}
+# load flows
+q_obs <- read_parquet(q_path)
+
+```
+
+```{r}
+# Merge daily drivers and flow
+df <- drivers_daily %>%
+  inner_join(q_obs, by = c("comid", "date" = "Date")) %>%
+  rename(q_m3s_obs = q_m3s) %>%
+  filter(!is.na(q_m3s_obs))
+
+```
+
+```{r}
+# load catchments and merge
+catchments <- st_read(catchment_out, quiet = TRUE)
+
+catchments_df <- st_drop_geometry(catchments) %>%
+  select(comid, areasqkm) %>%
+  mutate(area_m2 = areasqkm * 1e6)
+
+df <- df %>%
+  left_join(catchments_df, by = "comid") %>%
+  mutate(q_mm_day = (q_m3s_obs * 86400) / area_m2)
+
+```
+
+```{r}
+# Add Slope, Elevation, Length from Flowlines
+
+flowlines <- st_read(flowline_out, quiet = TRUE)
+flowlines_cols <- names(flowlines)
+
+# comid, lengthkm, slope, areasqkm, etc.
+# Fields to keep if available
+attrib_cols <- c("comid", "slope", "lengthkm", "streamorde")
+attrib_cols_present <- attrib_cols[attrib_cols %in% flowlines_cols]
+
+# Select only the existing columns
+flowlines_df <- st_drop_geometry(flowlines) %>%
+  select(all_of(attrib_cols_present))
+
+# Rename for consistency: make column names Title Case
+flowlines_df <- flowlines_df %>%
+  rename(
+    Slope = slope,
+    LengthKM = lengthkm
+    # No Elevation since it doesn't exist
+  )
+
+# Join attributes into df
+df <- df %>%
+  left_join(flowlines_df, by = "comid")
+
+```
+
+```{r}
+# Build edge list for graph models
+
+edge_list <- flowlines %>%
+  st_drop_geometry() %>%
+  select(comid, fromnode, tonode) %>%
+  filter(!is.na(fromnode), !is.na(tonode))
+```
+
+```{r}
+# Save outputs
+write_parquet(df, out_path_nodes)
+write_parquet(edge_list, out_path_edges)
+
+
+
+```
+

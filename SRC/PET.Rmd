@@ -1,0 +1,99 @@
+---
+title: "PET"
+author: "Daniel Dominguez"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=TRUE, warning=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Shared paths, packages, and helper functions
+source("SRC/Functions_Paths.R")
+```
+
+```{r}
+drivers_daily <- arrow::read_feather(drivers_path)
+```
+
+```{r}
+
+drivers_daily <- drivers_daily %>%
+  mutate(DOY = yday(date))
+```
+
+```{r}
+# Extract latitude for each catchment
+# Assumes catchments sf object has centroids for latitude
+
+# Extract latitude for each catchment
+catchments_centroid <- st_centroid(catchments)
+catchment_lat <- catchments_centroid %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  rename(lon = X, lat = Y) %>%
+  mutate(comid = catchments$comid)
+
+drivers_daily <- drivers_daily %>%
+  left_join(catchment_lat, by = "comid")
+
+```
+
+```{r}
+# compute Ra (extraterrestrial radiation, mm/day)
+# compute Ra (extraterrestrial radiation, mm/day)
+compute_Ra <- function(lat, DOY) {
+  Gsc <- 0.0820
+  dr  <- 1 + 0.033 * cos(2 * pi / 365 * DOY)
+  delta <- 0.409 * sin(2 * pi / 365 * DOY - 1.39)
+  phi <- lat * pi / 180
+  omega <- acos(-tan(phi) * tan(delta))
+  Ra_MJ <- (24 * 60 / pi) * Gsc * dr * (omega * sin(phi) * sin(delta) + cos(phi) * cos(delta) * sin(omega))
+  Ra_MJ * 0.408
+}
+
+# Ensure optional columns exist (so slide_* below won't error if basin fields are absent)
+if (!"bsn_pr" %in% names(drivers_daily))  drivers_daily$bsn_pr  <- NA_real_
+if (!"bsn_tmax_c" %in% names(drivers_daily)) drivers_daily$bsn_tmax_c <- NA_real_
+if (!"bsn_tmin_c" %in% names(drivers_daily)) drivers_daily$bsn_tmin_c <- NA_real_
+if (!"bsn_tmean_c" %in% names(drivers_daily)) drivers_daily$bsn_tmean_c <- NA_real_
+
+# Compute PET (Hargreaves) for catchments and basins, if inputs exist
+drivers_daily <- drivers_daily %>%
+  rowwise() %>%
+  mutate(
+    Ra = compute_Ra(lat, DOY),
+
+    # Catchment PET (uses tmax_c/tmin_c/tmean_c if present)
+    PET = if ("tmean_c" %in% names(.) && "tmax_c" %in% names(.) && "tmin_c" %in% names(.))
+      0.0023 * (tmean_c + 17.8) * sqrt(pmax(tmax_c - tmin_c, 0)) * Ra
+    else NA_real_,
+
+    # Basin PET (uses bsn_tmax_c/bsn_tmin_c/bsn_tmean_c if present)
+    bsn_PET = if ("bsn_tmean_c" %in% names(.) && "bsn_tmax_c" %in% names(.) && "bsn_tmin_c" %in% names(.))
+      0.0023 * (bsn_tmean_c + 17.8) * sqrt(pmax(bsn_tmax_c - bsn_tmin_c, 0)) * Ra
+    else NA_real_
+  ) %>%
+  ungroup()
+
+```
+
+```{r}
+drivers_daily <- drivers_daily %>%
+  mutate(DOY = as.numeric(format(date, "%j")))
+
+```
+
+```{r}
+drivers_daily <- drivers_daily %>%
+  mutate(DOY_sin = sin(2 * pi * DOY / 365),
+         DOY_cos = cos(2 * pi * DOY / 365)) 
+```
+
+
+```{r}
+write_feather(drivers_daily, daily_drivers_out)
+```
+
+

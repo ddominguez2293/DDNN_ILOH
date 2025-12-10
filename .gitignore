@@ -20,6 +20,7 @@
 
 # RStudio files
 .Rproj.user/
+*.Rproj
 
 # produced vignettes
 vignettes/*.html
@@ -47,3 +48,9 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Igore Data Folder
+/data
+
+# Ignore csv files
+*.csv

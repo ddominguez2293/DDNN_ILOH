@@ -1,0 +1,194 @@
+---
+title: "Watertemp"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+  
+---
+
+```{r setup, message=TRUE, warning=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Shared paths, packages, helper functions
+source("SRC/Functions_Paths.R")
+```
+
+```{r}
+
+#  Illinois River Basin bounding box
+
+# Approximate bounding box for HUC 0712 (Illinois River Basin)
+# Format: c(West, South, East, North)
+bbox_illinois <- c(-93.5, 36.8, -87.5, 42.0)  
+
+# Water temperature metadata
+
+meta_temp <- read_waterdata_ts_meta(
+  parameter_code = "00010",   # Water Temperature (°C)
+  bbox = bbox_illinois,       # Limit to Illinois River Basin
+  properties = c("monitoring_location_id", "parameter_code", "begin", "end", "time_series_id"),
+  skipGeometry = TRUE
+)
+
+# Clean and summarize metadata
+meta_temp_clean <- meta_temp %>%
+  filter(!is.na(begin), !is.na(end)) %>%
+  mutate(begin = as.Date(begin), end = as.Date(end)) %>%
+  group_by(monitoring_location_id) %>%
+  summarise(
+    parameter = first(parameter_code),
+    start_date = min(begin),
+    end_date = max(end),
+    n_series = n(),
+    .groups = "drop"
+  )
+
+# sanity check
+head(meta_temp_clean)
+
+# save metadata
+write.csv(meta_temp_clean, "illinois_water_temp_metadata.csv", row.names = FALSE)
+
+```
+
+```{r}
+# pull sites for water temp 
+sites_df <- meta_temp_clean %>%
+  distinct(monitoring_location_id)
+
+# Time window of interest
+start_date <- as.Date("2013-01-01")
+end_date   <- as.Date("2025-09-10")
+
+
+```
+
+```{r}
+# loop over all sites
+all_temp_data <- map_dfr(sites_df$monitoring_location_id, download_temp)
+
+```
+
+```{r}
+
+# Identify all water temp columns (exclude the *_cd flag columns)
+temp_cols <- grep("Wtemp$", names(all_temp_data), value = TRUE)
+
+# Pivot longer so each temp sensor reading is stacked
+all_temp_long <- all_temp_data %>%
+  pivot_longer(
+    cols = all_of(temp_cols),
+    names_to = "sensor",
+    values_to = "temp_value"
+  ) %>%
+  filter(!is.na(temp_value))  # keep only valid readings
+
+# Aggregate to one value per site/date (mean of sensors)
+all_temp_clean <- all_temp_long %>%
+  group_by(monitoring_location_id, Date) %>%
+  summarise(
+    water_temp_C = mean(temp_value, na.rm = TRUE),  # or median() if preferred
+    .groups = "drop"
+  )
+
+#sanity check
+head(all_temp_clean)
+
+write.csv(all_temp_clean, temp_clean_out, row.names = FALSE)
+
+
+
+```
+
+```{r}
+# Clean site IDs: remove "USGS-" prefix for NWIS calls
+site_ids_clean <- gsub("^USGS-", "", unique(all_temp_clean$monitoring_location_id))
+
+# Query site metadata (geometry auto-included if skipGeometry = FALSE)
+site_info <- read_waterdata_monitoring_location(
+  monitoring_location_id = paste0("USGS-", site_ids_clean),
+  skipGeometry = FALSE   # Keep geometry for coordinates
+)
+
+#  Extract coordinates from geometry
+site_coords <- site_info %>%
+  filter(!is.na(geometry)) %>%
+  st_as_sf() %>%
+  st_transform(4326) %>%
+  mutate(
+    longitude = st_coordinates(.)[,1],
+    latitude  = st_coordinates(.)[,2]
+  )
+
+# Load catchments (must already be in your nhd_dir folder)
+catchments <- st_read(file.path(nhd_dir, "catchments.gpkg"), quiet = TRUE)
+
+# Make sure everything is in the same CRS (we use EPSG:5070 for NHDPlus)
+catchments <- st_transform(catchments, 5070)  
+
+# Reproject site points to EPSG:5070 to match NHDPlus
+site_coords_5070 <- st_transform(site_coords, 5070)
+
+```
+
+```{r}
+# Spatial join: assign each site to its catchment
+sites_with_comid <- st_join(
+  site_coords_5070,
+  catchments %>% select(comid),  # keep only COMID column
+  join = st_nearest_feature
+)
+
+# Keep unique mapping of site to COMID
+sites_with_comid <- sites_with_comid %>%
+  st_drop_geometry() %>%   # drop geometry for final table
+  distinct(monitoring_location_id, comid)
+
+# sanity check
+head(sites_with_comid)
+
+```
+
+```{r}
+# Add COMID to water temperature dataset
+all_temp_comid <- all_temp_clean %>%
+  left_join(sites_with_comid, by = "monitoring_location_id") %>%
+  filter(!is.na(comid))   # keep only sites with COMID assigned
+
+# Check
+head(all_temp_comid)
+
+# Save for later use in model
+write.csv(all_temp_comid, temp_comid_out, row.names = FALSE)
+
+```
+
+```{r}
+
+# Read existing hydro_data parquet
+out_path_nodes <- file.path(daily_drivers_dir, "hydro_data.parquet")
+out_path_edges <- file.path(daily_drivers_dir, "edge_list.parquet")
+
+hydro_data <- read_parquet(out_path_nodes)
+
+# Aggregate water temperature by COMID + Date (mean)
+temp_daily <- all_temp_comid %>%
+  group_by(comid, Date) %>%
+  summarise(
+    water_temp_C = mean(water_temp_C, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  rename(date = Date)  # match hydro_data date column name
+
+# Merge water temp into hydro_data by comid + date
+hydro_temp_data <- hydro_data %>%
+  left_join(temp_daily, by = c("comid", "date"))
+
+# save outputs
+write_parquet(hydro_temp_data, out_path_nodes_temp)
+
+
+```
+
+
+

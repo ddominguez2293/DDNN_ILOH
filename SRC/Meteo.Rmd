@@ -1,0 +1,121 @@
+---
+title: "Meteo"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, message=TRUE, warning=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Shared paths + helper functions
+source("SRC/Functions_Paths.R")
+
+# Packages specific to meteorological extraction
+library(climateR)
+library(terra)
+library(exactextractr)
+```
+
+```{r}
+# read in catchments and basins
+catchments <- st_read(catchment_path, quiet = TRUE)
+basins <- st_read(basins_path, quiet = TRUE)
+
+```
+
+```{r}
+# set time window of interest
+start_date <- "2024-01-01" 
+end_date   <- "2025-09-10"   # adjust as needed
+
+#set parameters to retrieve
+vars <- c("pr",      # precipitation
+          "tmmx",    # max temp
+          "tmmn",    # min temp
+          "srad",    # solar radiation
+          "vs",      # wind speed
+          "vpd",     # vapor pressure deficit
+          "sph",       # specific humidity (can be used for RH)
+          "rmin",    # min relative humidity (%)
+          "rmax")     # max relative humidity (%))
+
+```
+
+```{r}
+# loop through all variables (catchments)
+all_data_catch <- lapply(vars, function(v) {
+extract_variable(
+varname = v,
+polygons = catchments,
+start_date = start_date,
+end_date = end_date,
+out_dir = meteo_dir,
+id_col = "comid"
+)
+})
+
+# munge together (don't overwrite daily_drivers_dir path var)
+drivers_catchments <- Reduce(function(x, y) dplyr::full_join(x, y, by = c("comid", "date")), all_data_catch)
+
+```
+
+```{r}
+all_data_basin <- lapply(vars, function(v) {
+extract_variable(
+varname = v,
+polygons = basins,
+start_date = start_date,
+end_date = end_date,
+out_dir = meteo_dir,
+id_col = "COMID"
+)
+})
+
+drivers_basins <- Reduce(function(x, y) dplyr::full_join(x, y, by = c("COMID", "date")), all_data_basin)
+
+# rename basin vars
+var_cols <- setdiff(names(drivers_basins), c("COMID", "date"))
+names(drivers_basins)[match(var_cols, names(drivers_basins))] <- paste0("bsn_", var_cols)
+
+drivers_basins <- drivers_basins %>%
+  rename(comid = COMID)
+
+```
+
+```{r}
+# Join by comid and date
+drivers_joined <- dplyr::full_join(drivers_catchments, drivers_basins, by = c("comid", "date"))
+
+
+```
+
+```{r}
+# Finalize & save using the joined table
+drivers_final <- drivers_joined %>%
+  mutate(
+    date = as.Date(date),
+    # Catchment temps (Kelvin -> °C) if present
+    tmax_c  = if ("tmmx" %in% names(.))  tmmx - 273.15 else NA_real_,
+    tmin_c  = if ("tmmn" %in% names(.))  tmmn - 273.15 else NA_real_,
+    tmean_c = (tmax_c + tmin_c) / 2,
+    # Basin temps (Kelvin -> °C) if present
+    bsn_tmax_c  = if ("bsn_tmmx" %in% names(.)) bsn_tmmx - 273.15 else NA_real_,
+    bsn_tmin_c  = if ("bsn_tmmn" %in% names(.)) bsn_tmmn - 273.15 else NA_real_,
+    bsn_tmean_c = (bsn_tmax_c + bsn_tmin_c) / 2
+  )
+
+drivers_subset <- drivers_final %>%
+  dplyr::select(
+    comid, date,
+    dplyr::any_of(c("pr","srad","vs","vpd","sph","rmin","rmax","tmax_c","tmin_c","tmean_c")),
+    dplyr::any_of(c("bsn_pr","bsn_srad","bsn_vs","bsn_vpd","bsn_sph","bsn_rmin","bsn_rmax",
+                    "bsn_tmax_c","bsn_tmin_c","bsn_tmean_c"))
+  )
+
+joined_feather <- file.path(daily_drivers_dir, "drivers_daily_joined.feather")
+arrow::write_feather(drivers_subset, joined_feather)
+
+head(drivers_subset)
+```
+

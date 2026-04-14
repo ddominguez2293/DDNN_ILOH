@@ -13,9 +13,11 @@ ohio = wbd_huc2.byid("huc2", ["05"])
 ohio_path = "data/shapes/ohio_river_basin.shp"
 ohio.to_file(ohio_path)
 
-# Illinois River Basin: HUC4 = 0712 (use wbd04 for HUC4 boundaries)
+# Illinois River Basin: HUC4 = 0712 + 0713, merged into one shapefile
 wbd_huc4 = WaterData("wbd04")
-illinois = wbd_huc4.byid("huc4", ["0712"])
+illinois_0712 = wbd_huc4.byid("huc4", ["0712"])
+illinois_0713 = wbd_huc4.byid("huc4", ["0713"])
+illinois = gpd.GeoDataFrame(pd.concat([illinois_0712, illinois_0713], ignore_index=True)).dissolve()
 illinois_path = "data/shapes/illinois_river_basin.shp"
 illinois.to_file(illinois_path)
 

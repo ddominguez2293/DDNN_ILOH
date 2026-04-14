@@ -5,86 +5,128 @@ editor_options:
   chunk_output_type: console
 ---
 
-```{r setup, message=TRUE, warning=TRUE}
-knitr::opts_chunk$set(echo = TRUE)
 
-# Shared paths, packages, helper functions
+# Too big to handle this script use Q_Processing_python.py instead it handles huge tables better. 
+```{r}
+suppressPackageStartupMessages({
+  library(arrow)
+  library(dplyr)
+})
+
 source("SRC/Functions_Paths.R")
+
+drivers_feather <- daily_drivers_out  # your .feather path
+drivers_parquet_dir <- file.path(dirname(drivers_feather), "drivers_daily_joined_PET_parquet")
+
+# Read feather (this may still be big, but usually feasible; if not, see note below)
+drivers_daily <- arrow::read_feather(drivers_feather) %>%
+  mutate(
+    comid = as.integer(comid),
+    date  = as.Date(date)
+  )
+
+# Write as a parquet dataset (partitioning helps future joins)
+arrow::write_dataset(
+  drivers_daily,
+  path = drivers_parquet_dir,
+  format = "parquet",
+  partitioning = c("comid"),
+  existing_data_behavior = "overwrite"
+)
+
+cat("WROTE parquet dataset:", drivers_parquet_dir, "\n")
 
 ```
 
 ```{r}
 # Load merged climate vars with PET
-drivers_daily <- read_feather(daily_drivers_out)
-
+drivers_daily <- read_feather(daily_drivers_out) %>%
+  mutate(
+    comid = as.integer(comid),
+    date  = as.Date(date)
+  )
 ```
 
 ```{r}
 # load flows
-q_obs <- read_parquet(q_path)
-
+q_obs <- read_parquet(q_path) %>%
+  transmute(
+    comid = as.integer(comid),
+    Date  = as.Date(Date),
+    q_m3s = as.numeric(q_m3s)
+  )
 ```
 
 ```{r}
 # Merge daily drivers and flow
 df <- drivers_daily %>%
-  inner_join(q_obs, by = c("comid", "date" = "Date")) %>%
-  rename(q_m3s_obs = q_m3s) %>%
-  filter(!is.na(q_m3s_obs))
+  left_join(q_obs, by = c("comid", "date" = "Date")) %>%
+  rename(q_m3s_obs = q_m3s)
 
 ```
 
 ```{r}
-# load catchments and merge
-catchments <- st_read(catchment_out, quiet = TRUE)
-
-catchments_df <- st_drop_geometry(catchments) %>%
-  select(comid, areasqkm) %>%
-  mutate(area_m2 = areasqkm * 1e6)
+catchment_out <- file.path(nhd_dir, "catchments.gpkg")
+catchments_df <- st_read(catchment_out, quiet = TRUE) %>%
+  st_drop_geometry() %>%
+  transmute(
+    comid   = as.integer(comid),
+    areasqkm = as.numeric(areasqkm),
+    area_m2  = areasqkm * 1e6
+  )
 
 df <- df %>%
   left_join(catchments_df, by = "comid") %>%
-  mutate(q_mm_day = (q_m3s_obs * 86400) / area_m2)
+  mutate(
+    q_mm_day = ifelse(!is.na(q_m3s_obs) & !is.na(area_m2) & area_m2 > 0,
+                      (q_m3s_obs * 86400) / area_m2,
+                      NA_real_)
+  )
 
 ```
 
 ```{r}
-# Add Slope, Elevation, Length from Flowlines
+flowline_out <- file.path(nhd_dir, "flowlines.gpkg")
+flowlines <- st_read(flowline_out, quiet = TRUE) %>%
+  mutate(comid = as.integer(comid))
 
-flowlines <- st_read(flowline_out, quiet = TRUE)
-flowlines_cols <- names(flowlines)
-
-# comid, lengthkm, slope, areasqkm, etc.
-# Fields to keep if available
-attrib_cols <- c("comid", "slope", "lengthkm", "streamorde")
-attrib_cols_present <- attrib_cols[attrib_cols %in% flowlines_cols]
-
-# Select only the existing columns
-flowlines_df <- st_drop_geometry(flowlines) %>%
-  select(all_of(attrib_cols_present))
-
-# Rename for consistency: make column names Title Case
-flowlines_df <- flowlines_df %>%
-  rename(
-    Slope = slope,
-    LengthKM = lengthkm
-    # No Elevation since it doesn't exist
+flowlines_df <- flowlines %>%
+  st_drop_geometry() %>%
+  transmute(
+    comid      = as.integer(comid),
+    Slope      = suppressWarnings(as.numeric(slope)),
+    LengthKM   = suppressWarnings(as.numeric(lengthkm)),
+    streamorde = suppressWarnings(as.integer(streamorde)),
+    fromnode   = suppressWarnings(as.integer(fromnode)),
+    tonode     = suppressWarnings(as.integer(tonode))
   )
 
-# Join attributes into df
 df <- df %>%
-  left_join(flowlines_df, by = "comid")
+  left_join(flowlines_df %>% select(comid, Slope, LengthKM, streamorde), by = "comid")
+
 
 ```
 
 ```{r}
 # Build edge list for graph models
 
-edge_list <- flowlines %>%
-  st_drop_geometry() %>%
+edge_list <- flowlines_df %>%
   select(comid, fromnode, tonode) %>%
   filter(!is.na(fromnode), !is.na(tonode))
 ```
+
+```{r}
+cat("drivers_daily rows:", nrow(drivers_daily), " unique comid:", dplyr::n_distinct(drivers_daily$comid), "\n")
+cat("q_obs rows:", nrow(q_obs), " unique comid:", dplyr::n_distinct(q_obs$comid), "\n")
+cat("df (nodes) rows:", nrow(df), " unique comid:", dplyr::n_distinct(df$comid),
+    " date range:", as.character(min(df$date)), "to", as.character(max(df$date)), "\n")
+cat("pct rows with observed q:", round(100 * mean(!is.na(df$q_m3s_obs)), 2), "%\n")
+
+cat("flowlines rows:", nrow(flowlines_df), " unique comid:", dplyr::n_distinct(flowlines_df$comid), "\n")
+cat("edge_list rows:", nrow(edge_list), " unique comid:", dplyr::n_distinct(edge_list$comid), "\n")
+
+```
+
 
 ```{r}
 # Save outputs

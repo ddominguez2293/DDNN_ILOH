@@ -54,3 +54,10 @@ rsconnect/
 
 # Ignore csv files
 *.csv
+
+*.RData
+*.RDataTmp1
+*.RDataTmp2
+
+# png
+*.png

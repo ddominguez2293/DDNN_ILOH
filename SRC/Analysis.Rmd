@@ -1,0 +1,431 @@
+---
+title: "Analysis"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(arrow)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(sf)
+library(scales)
+```
+
+```{r}
+# Paths (match what the UPDATED Python script writes)
+# 1) Main file: contains q_pred_m3s_raw, q_pred_m3s_constrained, temp_pred_C
+#pred_path <- "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/hydro_temp_data_analysis_pre2013_predictions_optionA.parquet"
+
+# 2) Optional legacy file: constrained-only (q_pred_m3s + temp_pred_C)
+#pred_con_legacy_path <- "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/hydro_temp_data_analysis_pre2013_predictions_optionA_constrained_only.parquet"
+
+```
+
+```{r}
+
+source("SRC/Functions_Paths.R")
+
+# 1) Main file (pred_df)
+pred_path <- "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/hydro_temp_data_analysis_pre2013_predictions_graph_pre2013.parquet"
+
+pred_df <- read_parquet(pred_path)
+
+daily_drivers <-  "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/hydro_temp_data_trainval_2013plus.parquet"
+
+daily_drivers_df<-read_parquet(daily_drivers)
+
+comid_streamorder <- daily_drivers_df %>%
+  distinct(comid, streamorde) %>%
+  arrange(streamorde, comid)
+
+pred_df <- pred_df %>%
+  left_join(
+    daily_drivers_df %>%
+      distinct(comid, streamorde) %>%
+      rename(streamorder = streamorde),
+    by = "comid"
+  )
+```
+
+
+```{r}
+# -------------------------
+# Load predictions (UPDATED outputs)
+# -------------------------
+pred <- read_parquet(pred_path) %>%
+  mutate(date = as.Date(date))
+
+
+# Quick sanity checks
+glimpse(pred)
+summary(pred$q_pred_m3s_raw)
+summary(pred$q_pred_m3s_constrained)
+summary(pred$temp_pred_C)
+
+
+```
+
+```{r}
+# -------------------------
+# Overall summaries (raw vs constrained)
+# -------------------------
+overall_summary <- pred %>%
+  summarise(
+    n = n(),
+
+    # RAW Q
+    frac_neg_q_raw  = mean(q_pred_m3s_raw <  0, na.rm = TRUE),
+    frac_zero_q_raw = mean(q_pred_m3s_raw == 0, na.rm = TRUE),
+    frac_pos_q_raw  = mean(q_pred_m3s_raw >  0, na.rm = TRUE),
+    min_q_raw = min(q_pred_m3s_raw, na.rm = TRUE),
+    med_q_raw = median(q_pred_m3s_raw, na.rm = TRUE),
+    p95_q_raw = quantile(q_pred_m3s_raw, 0.95, na.rm = TRUE),
+    max_q_raw = max(q_pred_m3s_raw, na.rm = TRUE),
+
+    # CONSTRAINED Q
+    frac_zero_q_con = mean(q_pred_m3s_constrained == 0, na.rm = TRUE),
+    frac_pos_q_con  = mean(q_pred_m3s_constrained >  0, na.rm = TRUE),
+    min_q_con = min(q_pred_m3s_constrained, na.rm = TRUE),
+    med_q_con = median(q_pred_m3s_constrained, na.rm = TRUE),
+    p95_q_con = quantile(q_pred_m3s_constrained, 0.95, na.rm = TRUE),
+    max_q_con = max(q_pred_m3s_constrained, na.rm = TRUE),
+
+    # Temp
+    min_t = min(temp_pred_C, na.rm = TRUE),
+    med_t = median(temp_pred_C, na.rm = TRUE),
+    p95_t = quantile(temp_pred_C, 0.95, na.rm = TRUE),
+    max_t = max(temp_pred_C, na.rm = TRUE)
+  )
+
+overall_summary
+
+```
+
+
+```{r}
+# -------------------------
+# Two-bin summary helper (for Q sign checks)
+# -------------------------
+two_bin_summary <- function(df, col) {
+  x <- df[[col]]
+  n_total <- sum(!is.na(x))
+  n_neg <- sum(x < 0, na.rm = TRUE)
+  n_pos <- sum(x > 0, na.rm = TRUE)
+
+  tibble(
+    col = col,
+    n_total = n_total,
+    n_neg   = n_neg,
+    pct_neg = 100 * n_neg / pmax(n_total, 1),
+    n_pos   = n_pos,
+    pct_pos = 100 * n_pos / pmax(n_total, 1)
+  )
+}
+
+bind_rows(
+  two_bin_summary(pred, "q_pred_m3s_raw") %>% mutate(dataset = "pred"),
+  two_bin_summary(pred, "q_pred_m3s_constrained") %>% mutate(dataset = "pred")
+) %>%
+  select(dataset, everything())
+
+```
+
+```{r}
+
+# -------------------------
+# Histograms (log-y): Q raw, Q constrained, Temp
+# -------------------------
+ggplot(pred, aes(x = q_pred_m3s_raw)) +
+  geom_histogram(bins = 250) +
+  scale_y_log10() +
+  labs(
+    title = "Histogram: Predicted Discharge (q_pred_m3s_raw)",
+    x = "Predicted Q (m³/s)",
+    y = "Count (log10)"
+  ) +
+  theme_bw()
+
+ggplot(pred, aes(x = q_pred_m3s_constrained)) +
+  geom_histogram(bins = 250) +
+  scale_y_log10() +
+  labs(
+    title = "Histogram: Predicted Discharge (q_pred_m3s_constrained)",
+    x = "Predicted Q (m³/s)",
+    y = "Count (log10)"
+  ) +
+  theme_bw()
+
+ggplot(pred, aes(x = temp_pred_C)) +
+  geom_histogram(bins = 200) +
+  scale_y_log10() +
+  labs(
+    title = "Histogram: Predicted Water Temperature (temp_pred_C)",
+    x = "Predicted Temp (°C)",
+    y = "Count (log10)"
+  ) +
+  theme_bw()
+
+```
+
+```{r}
+# -------------------------
+# Yearly summaries (choose which Q column you want)
+# -------------------------
+yearly_q_counts <- pred %>%
+  mutate(year = year(date)) %>%
+  group_by(year) %>%
+  summarise(
+    # RAW Q
+    n_total_raw = sum(!is.na(q_pred_m3s_raw)),
+    n_neg_raw   = sum(q_pred_m3s_raw < 0, na.rm = TRUE),
+    n_zero_raw  = sum(q_pred_m3s_raw == 0, na.rm = TRUE),
+    n_pos_raw   = sum(q_pred_m3s_raw > 0, na.rm = TRUE),
+    pct_neg_raw  = 100 * n_neg_raw  / pmax(n_total_raw, 1),
+    pct_zero_raw = 100 * n_zero_raw / pmax(n_total_raw, 1),
+    pct_pos_raw  = 100 * n_pos_raw  / pmax(n_total_raw, 1),
+    min_q_raw = min(q_pred_m3s_raw, na.rm = TRUE),
+    p05_q_raw = quantile(q_pred_m3s_raw, 0.05, na.rm = TRUE),
+    med_q_raw = median(q_pred_m3s_raw, na.rm = TRUE),
+    p95_q_raw = quantile(q_pred_m3s_raw, 0.95, na.rm = TRUE),
+    max_q_raw = max(q_pred_m3s_raw, na.rm = TRUE),
+
+    # CONSTRAINED Q
+    n_total_con = sum(!is.na(q_pred_m3s_constrained)),
+    n_zero_con  = sum(q_pred_m3s_constrained == 0, na.rm = TRUE),
+    n_pos_con   = sum(q_pred_m3s_constrained > 0, na.rm = TRUE),
+    pct_zero_con = 100 * n_zero_con / pmax(n_total_con, 1),
+    pct_pos_con  = 100 * n_pos_con  / pmax(n_total_con, 1),
+    min_q_con = min(q_pred_m3s_constrained, na.rm = TRUE),
+    p05_q_con = quantile(q_pred_m3s_constrained, 0.05, na.rm = TRUE),
+    med_q_con = median(q_pred_m3s_constrained, na.rm = TRUE),
+    p95_q_con = quantile(q_pred_m3s_constrained, 0.95, na.rm = TRUE),
+    max_q_con = max(q_pred_m3s_constrained, na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  arrange(year)
+
+yearly_q_counts
+
+```
+
+```{r}
+# -------------------------
+# COMID-year summary: % zero / % positive (RAW vs constrained)
+# -------------------------
+comid_year_summary <- pred %>%
+  mutate(year = year(date)) %>%
+  group_by(comid, year) %>%
+  summarise(
+    n = n(),
+
+    # RAW Q
+    pct_neg_raw  = 100 * mean(q_pred_m3s_raw < 0, na.rm = TRUE),
+    pct_zero_raw = 100 * mean(q_pred_m3s_raw == 0, na.rm = TRUE),
+    pct_pos_raw  = 100 * mean(q_pred_m3s_raw >  0, na.rm = TRUE),
+
+    # CONSTRAINED Q
+    pct_zero_con = 100 * mean(q_pred_m3s_constrained == 0, na.rm = TRUE),
+    pct_pos_con  = 100 * mean(q_pred_m3s_constrained >  0, na.rm = TRUE),
+
+    .groups = "drop"
+  )
+
+# Top 50 COMID-years that are fully zero after constraint
+comid_year_summary %>%
+  filter(pct_zero_con == 100) %>%
+  arrange(desc(n)) %>%
+  head(50)
+
+# How many unique COMIDs have at least one fully-zero year (constrained)?
+comid_year_summary %>%
+  summarise(n_comid_any_allzero_year_con = n_distinct(comid[pct_zero_con == 100]))
+
+
+```
+
+```{r}
+# -------------------------
+# Map predictions for ONE day on NHD flowlines
+# -------------------------
+
+flowlines_path <- "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/nhdplus/flowlines.gpkg"
+day_to_plot <- as.Date("2008-07-22")
+
+# Helper: guess COMID column in flowlines
+guess_comid_col <- function(x) {
+  nms <- names(x)
+  # common candidates first
+  cand <- c("comid", "COMID", "ComID", "nhdplus_comid", "NHDPlusCOMID", "NHDPlusID", "nhdplusid")
+  hit <- cand[cand %in% nms]
+  if (length(hit) > 0) return(hit[1])
+  # fallback: any column containing "comid"
+  hit2 <- nms[grepl("comid", tolower(nms))]
+  if (length(hit2) > 0) return(hit2[1])
+  stop("Could not find a COMID column in flowlines.gpkg. Columns: ", paste(nms, collapse=", "))
+}
+
+# 1) Filter predictions to one day
+pred_day <- pred %>%
+  filter(date == day_to_plot) %>%
+  mutate(comid = as.integer(comid))
+
+cat("\nDay filter:", as.character(day_to_plot), "\n")
+cat("Rows in pred_day:", nrow(pred_day), "\n")
+cat("Unique COMIDs in pred_day:", n_distinct(pred_day$comid), "\n")
+
+if (nrow(pred_day) == 0) {
+  stop("No prediction rows found for day_to_plot. Check date range in pred.")
+}
+
+# 2) Read flowlines + find COMID column
+flow <- st_read(flowlines_path, quiet = TRUE)
+
+comid_col <- guess_comid_col(flow)
+cat("Detected flowlines COMID column:", comid_col, "\n")
+
+flow <- flow %>%
+  mutate(comid = as.integer(.data[[comid_col]]))
+
+# 3) Join predictions onto flowlines (keep all flowlines for gray basemap)
+flow_join <- flow %>%
+  left_join(pred_day, by = "comid")
+
+cat("Flowlines total:", nrow(flow_join), "\n")
+cat("Flowlines w/ predictions (non-NA Q):", sum(!is.na(flow_join$q_pred_m3s_constrained)), "\n")
+
+# Optional: crop to bounding box of predicted flowlines (for tighter map)
+pred_bbox <- st_bbox(flow_join[!is.na(flow_join$q_pred_m3s_constrained), ])
+flow_base <- st_crop(flow_join, pred_bbox)
+
+# -------------------------
+# Plot 1: Discharge (constrained)
+# -------------------------
+p_q <- ggplot() +
+  geom_sf(data = flow_base, color = "lightgray", linewidth = 0.1) +
+  geom_sf(
+    data = dplyr::filter(flow_base, !is.na(q_pred_m3s_constrained)),
+    aes(color = q_pred_m3s_constrained),
+    linewidth = 0.9
+  ) +
+  scale_color_viridis_c(
+    option = "C",
+    trans = "identity",              # helps visually like your example; change to "identity" if you want linear
+    labels = label_number(accuracy = 1),
+    name = "Q (m³/s)"
+  ) +
+  labs(
+    title = "Predicted discharge (constrained) on flowlines",
+    subtitle = paste0("Date: ", day_to_plot, " | colored = COMIDs present in prediction set")
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_line(color = "grey90"),
+    legend.position = "right"
+  )
+
+p_q
+
+# -------------------------
+# Plot 2: Water temperature
+# -------------------------
+p_t <- ggplot() +
+  geom_sf(data = flow_base, color = "lightgray", linewidth = 0.01) +
+  geom_sf(
+    data = dplyr::filter(flow_base, !is.na(temp_pred_C)),
+    aes(color = temp_pred_C),
+    linewidth = 0.9
+  ) +
+  scale_color_viridis_c(
+    option = "C",
+    labels = label_number(accuracy = 0.1),
+    name = "Temp (°C)"
+  ) +
+  labs(
+    title = "Predicted water temperature on flowlines",
+    subtitle = paste0("Date: ", day_to_plot, " | colored = COMIDs present in prediction set")
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_line(color = "grey90"),
+    legend.position = "right"
+  )
+
+p_t
+
+```
+
+```{r}
+# =========================================================
+# Reproduce TEMP map with flagged COMIDs removed
+#   - Uses the troubleshooting COMID list saved locally
+# =========================================================
+
+# Local path (your directory)
+temp_troubleshoot_comid_counts_path <- "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/temp_troubleshooting_comid_rowcounts.csv"
+
+# 1) Read COMIDs to remove
+comids_remove <- read.csv(temp_troubleshoot_comid_counts_path) %>%
+  mutate(comid = as.integer(comid)) %>%
+  filter(n_rows_hotspots > 0 | n_rows_bad_temp_file > 0) %>%
+  distinct(comid)
+
+cat("\n[COMID Removal] flagged COMIDs:", nrow(comids_remove), "\n")
+
+# 2) Recreate pred_day for the same day, but REMOVE those COMIDs
+pred_day_filt <- pred %>%
+  filter(date == day_to_plot) %>%
+  mutate(comid = as.integer(comid)) %>%
+  anti_join(comids_remove, by = "comid")
+
+cat("[Filtered day] Rows:", nrow(pred_day_filt), "\n")
+cat("[Filtered day] Unique COMIDs:", n_distinct(pred_day_filt$comid), "\n")
+
+if (nrow(pred_day_filt) == 0) {
+  stop("After filtering flagged COMIDs, no prediction rows remain for this day.")
+}
+
+# 3) Join filtered predictions onto flowlines
+flow_join_filt <- flow %>%
+  left_join(pred_day_filt, by = "comid")
+
+cat("[Filtered join] Flowlines w/ predictions (non-NA Temp):",
+    sum(!is.na(flow_join_filt$temp_pred_C)), "\n")
+
+# 4) Crop bbox based on TEMP (since we’re reproducing temp plot)
+pred_bbox_filt <- st_bbox(flow_join_filt[!is.na(flow_join_filt$temp_pred_C), ])
+flow_base_filt <- st_crop(flow_join_filt, pred_bbox_filt)
+
+# 5) Plot: Water temperature (filtered COMIDs removed)
+p_t_filtered <- ggplot() +
+  geom_sf(data = flow_base_filt, color = "lightgray", linewidth = 0.01) +
+  geom_sf(
+    data = dplyr::filter(flow_base_filt, !is.na(temp_pred_C)),
+    aes(color = temp_pred_C),
+    linewidth = 0.9
+  ) +
+  scale_color_viridis_c(
+    option = "C",
+    labels = label_number(accuracy = 0.1),
+    name = "Temp (°C)"
+  ) +
+  labs(
+    title = "Predicted water temperature on flowlines (flagged COMIDs removed)",
+    subtitle = paste0("Date: ", day_to_plot,
+                      " | removed COMIDs in temp troubleshooting list (n=",
+                      nrow(comids_remove), ")")
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major = element_line(color = "grey90"),
+    legend.position = "right"
+  )
+
+p_t_filtered
+
+
+```
+

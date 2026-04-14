@@ -2,10 +2,246 @@
 title: "Watertemp"
 output: html_document
 editor_options: 
-  chunk_output_type: console
   
+  chunk_output_type: console
 ---
+#test
 
+```{r}
+# ============================================================
+# hydro_temp_build_from_python_nodes.R
+# Purpose:
+#   - Pull USGS water temp for Illinois River Basin (bbox)
+#   - Map temp sites -> COMID via catchments
+#   - Aggregate to temp_daily (comid, date)
+#   - LEFT JOIN temp_daily onto Python-built ALL-COMID nodes parquet
+#   - Write hydro_temp_data_analysis_pre2013 + hydro_temp_data_trainval_2013plus
+# ============================================================
+
+
+# -------------------------
+# 0) Shared paths / helpers
+# -------------------------
+source("SRC/Functions_Paths.R")
+
+# You must have these in Functions_Paths.R OR set them here:
+#   nhd_dir, daily_drivers_dir
+#   temp_clean_out, temp_comid_out
+#   (and your download_temp() function, if you used one)
+#
+# Python outputs (set to your real paths):
+nodes_parquet_dir <- file.path(daily_drivers_dir, "hydro_nodes_allcomids_parquet")   # directory
+edges_parquet     <- file.path(daily_drivers_dir, "edge_list.parquet")              # file
+
+flowline_out   <- file.path(nhd_dir, "flowlines.gpkg")
+catchment_out  <- file.path(nhd_dir, "catchments.gpkg")
+
+# Output hydro+temp files
+out_analysis <- file.path(daily_drivers_dir, "hydro_temp_data_analysis_pre2013.parquet")
+out_trainval <- file.path(daily_drivers_dir, "hydro_temp_data_trainval_2013plus.parquet")
+
+# Time window
+start_date <- as.Date("1984-01-01")
+end_date   <- as.Date("2025-09-10")
+cut_date   <- as.Date("2013-01-01")
+
+# -------------------------
+# 1) Illinois River Basin bbox (HUC 0712 approx)
+# -------------------------
+bbox_illinois <- c(-93.5, 36.8, -87.5, 42.0)  # West, South, East, North
+
+# -------------------------
+# 2) Water temperature metadata (00010)
+# -------------------------
+meta_temp <- read_waterdata_ts_meta(
+  parameter_code = "00010",
+  bbox = bbox_illinois,
+  properties = c("monitoring_location_id", "parameter_code", "begin", "end", "time_series_id"),
+  skipGeometry = TRUE
+)
+
+meta_temp_clean <- meta_temp %>%
+  filter(!is.na(begin), !is.na(end)) %>%
+  mutate(begin = as.Date(begin), end = as.Date(end)) %>%
+  group_by(monitoring_location_id) %>%
+  summarise(
+    parameter = first(parameter_code),
+    start_date = min(begin),
+    end_date = max(end),
+    n_series = n(),
+    .groups = "drop"
+  )
+
+write.csv(meta_temp_clean, "illinois_water_temp_metadata.csv", row.names = FALSE)
+
+sites_df <- meta_temp_clean %>% distinct(monitoring_location_id)
+
+# -------------------------
+# 3) Download temperature for all sites
+#     IMPORTANT: assumes you already have a function:
+#       download_temp(site_id) -> returns a data.frame with columns:
+#         monitoring_location_id, Date, <one or more *Wtemp columns>
+#     If you don’t, keep your existing download_temp() definition in SRC.
+# -------------------------
+# Example expectation:
+# download_temp <- function(site_id) { ... }
+
+all_temp_data <- purrr::map_dfr(sites_df$monitoring_location_id, download_temp)
+
+# -------------------------
+# 4) Clean + aggregate temp to one value per (site, Date)
+# -------------------------
+temp_cols <- grep("Wtemp$", names(all_temp_data), value = TRUE)
+
+all_temp_clean <- all_temp_data %>%
+  pivot_longer(
+    cols = all_of(temp_cols),
+    names_to = "sensor",
+    values_to = "temp_value"
+  ) %>%
+  filter(!is.na(temp_value)) %>%
+  group_by(monitoring_location_id, Date) %>%
+  summarise(
+    water_temp_C = mean(temp_value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+if (!exists("temp_clean_out")) {
+  temp_clean_out <- file.path(daily_drivers_dir, "illinois_water_temp_clean.csv")
+}
+
+write.csv(all_temp_clean, temp_clean_out, row.names = FALSE)
+
+# -------------------------
+# 5) Get site coordinates + map sites -> COMID
+# -------------------------
+site_ids_clean <- gsub("^USGS-", "", unique(all_temp_clean$monitoring_location_id))
+
+site_info <- read_waterdata_monitoring_location(
+  monitoring_location_id = paste0("USGS-", site_ids_clean),
+  skipGeometry = FALSE
+)
+
+site_coords <- site_info %>%
+  filter(!is.na(geometry)) %>%
+  st_as_sf() %>%
+  st_transform(4326) %>%
+  mutate(
+    longitude = st_coordinates(.)[, 1],
+    latitude  = st_coordinates(.)[, 2]
+  )
+
+catchments <- st_read(catchment_out, quiet = TRUE) %>%
+  st_transform(5070)
+
+site_coords_5070 <- st_transform(site_coords, 5070)
+
+sites_with_comid <- st_join(
+  site_coords_5070,
+  catchments %>% select(comid),
+  join = st_nearest_feature
+) %>%
+  st_drop_geometry() %>%
+  distinct(monitoring_location_id, comid)
+
+# -------------------------
+# 6) Add COMID to temp + aggregate to (comid, date)
+# -------------------------
+all_temp_comid <- all_temp_clean %>%
+  left_join(sites_with_comid, by = "monitoring_location_id") %>%
+  filter(!is.na(comid))
+
+write.csv(all_temp_comid, temp_comid_out, row.names = FALSE)
+
+temp_daily <- all_temp_comid %>%
+  mutate(
+    comid = as.integer(comid),
+    date  = as.Date(Date)
+  ) %>%
+  filter(date >= start_date, date <= end_date) %>%
+  group_by(comid, date) %>%
+  summarise(
+    water_temp_C = ifelse(all(is.na(water_temp_C)), NA_real_, mean(water_temp_C, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# Hard uniqueness check (cheap, in-memory: temp is small)
+if (any(duplicated(temp_daily[c("comid", "date")]))) {
+  stop("temp_daily has duplicate (comid,date) rows — fix aggregation.")
+}
+
+cat("\nTemp daily summary:\n")
+print(temp_daily %>% summarise(n_rows=n(), n_comids=n_distinct(comid), min_date=min(date), max_date=max(date)))
+
+# -------------------------
+# 7) Open Python-built NODES (ALL COMIDs) with Arrow + join temp
+# -------------------------
+# Python wrote: hydro_nodes_allcomids_parquet/nodes.parquet (in your run)
+# Using open_dataset on the directory works for a single parquet file too.
+nodes_ds <- arrow::open_dataset(nodes_parquet_dir, format = "parquet")
+
+sch <- nodes_ds$schema
+print(sch$names)
+# Quick sanity without pulling 119M rows into RAM
+cat("\nNodes (Arrow) columns:\n")
+print(names(nodes_ds))
+
+# Build Arrow table for temp_daily for joining
+temp_tbl <- arrow::arrow_table(temp_daily)
+
+# LEFT JOIN in Arrow (lazy)
+nodes_with_temp <- nodes_ds %>%
+  left_join(temp_tbl, by = c("comid", "date"))
+
+# Optional: spot-check counts (still computed via Arrow)
+nodes_stats <- nodes_with_temp %>%
+  summarise(
+    n_rows  = n(),
+    n_comid = n_distinct(comid),
+    min_date = min(date),
+    max_date = max(date),
+    pct_rows_with_temp = mean(!is.na(water_temp_C))
+  ) %>%
+  collect()
+
+cat("\nNODES+TEMP summary (Arrow computed):\n")
+print(nodes_stats)
+
+# -------------------------
+# 8) Split + write parquet outputs (still Arrow -> disk, no RAM blowup)
+# -------------------------
+analysis_ds <- nodes_with_temp %>% filter(date < cut_date)
+trainval_ds <- nodes_with_temp %>% filter(date >= cut_date)
+
+# Write to single parquet files (fast enough, but big).
+# If you prefer partitioned datasets, I can switch this to write_dataset().
+arrow::write_parquet(analysis_ds, out_analysis, compression = "zstd")
+arrow::write_parquet(trainval_ds, out_trainval, compression = "zstd")
+
+cat("\nWrote:\n")
+cat(" - ", out_analysis, "\n", sep = "")
+cat(" - ", out_trainval, "\n", sep = "")
+
+# -------------------------
+# 9) Flowlines COMID count (your last chunk)
+# -------------------------
+flowlines <- st_read(flowline_out, quiet = TRUE) %>% mutate(comid = as.integer(comid))
+cat("\nUnique flowlines COMIDs:", dplyr::n_distinct(flowlines$comid), "\n")
+
+# Edges exist already (Python wrote them); just confirm:
+if (file.exists(edges_parquet)) {
+  edge_meta <- arrow::read_parquet(edges_parquet) %>%
+    summarise(n_rows=n(), n_comids=n_distinct(comid))
+  cat("\nEdges parquet summary:\n")
+  print(edge_meta)
+} else {
+  warning("Edges parquet not found at: ", edges_parquet)
+}
+
+```
+
+
+#end test
 ```{r setup, message=TRUE, warning=TRUE}
 knitr::opts_chunk$set(echo = TRUE)
 
@@ -57,7 +293,7 @@ sites_df <- meta_temp_clean %>%
   distinct(monitoring_location_id)
 
 # Time window of interest
-start_date <- as.Date("2013-01-01")
+start_date <- as.Date("1984-01-01")
 end_date   <- as.Date("2025-09-10")
 
 
@@ -165,30 +401,113 @@ write.csv(all_temp_comid, temp_comid_out, row.names = FALSE)
 
 ```{r}
 
-# Read existing hydro_data parquet
+# Build hydro_temp_data with strict (comid, date) uniqueness, then split 
+# Build hydro_temp_data with strict (comid, date) uniqueness, then split 
+# Inputs
 out_path_nodes <- file.path(daily_drivers_dir, "hydro_data.parquet")
-out_path_edges <- file.path(daily_drivers_dir, "edge_list.parquet")
+out_path_edges <- file.path(daily_drivers_dir, "edge_list.parquet")  # kept for parity (not used here)
 
-hydro_data <- read_parquet(out_path_nodes)
+hydro_data <- read_parquet(out_path_nodes) %>%
+  mutate(date = as.Date(date))
 
-# Aggregate water temperature by COMID + Date (mean)
-temp_daily <- all_temp_comid %>%
-  group_by(comid, Date) %>%
+# 1) Enforce one row per (comid, date) in hydro_data (dedup safely)
+hydro_data_dedup <- hydro_data %>%
+  group_by(comid, date) %>%
   summarise(
-    water_temp_C = mean(water_temp_C, na.rm = TRUE),
+    across(where(is.numeric), ~ ifelse(all(is.na(.x)), NA_real_, mean(.x, na.rm = TRUE))),
+    across(where(~ !is.numeric(.x)), ~ dplyr::first(.x)),
     .groups = "drop"
-  ) %>%
-  rename(date = Date)  # match hydro_data date column name
+  )
 
-# Merge water temp into hydro_data by comid + date
-hydro_temp_data <- hydro_data %>%
+dup_h <- sum(duplicated(hydro_data_dedup[c("comid", "date")]))
+if (dup_h > 0) stop(paste("hydro_data still has duplicate (comid,date) after dedup:", dup_h))
+
+# 2) Aggregate temperature to one row per (comid, date) (robust to all-NA days)
+temp_daily <- all_temp_comid %>%
+  mutate(date = as.Date(Date)) %>%
+  group_by(comid, date) %>%
+  summarise(
+    water_temp_C = ifelse(all(is.na(water_temp_C)), NA_real_, mean(water_temp_C, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+dup_t <- sum(duplicated(temp_daily[c("comid", "date")]))
+if (dup_t > 0) stop(paste("temp_daily has duplicate (comid,date):", dup_t))
+
+# 3) Join (should remain unique)
+hydro_temp_data <- hydro_data_dedup %>%
   left_join(temp_daily, by = c("comid", "date"))
 
-# save outputs
-write_parquet(hydro_temp_data, out_path_nodes_temp)
+dup_j <- sum(duplicated(hydro_temp_data[c("comid", "date")]))
+if (dup_j > 0) stop(paste("hydro_temp_data has duplicate (comid,date) after join:", dup_j))
+
+# --------------------------------------------------------------------
+# 4) REMOVE SENTINELS BEFORE SPLIT/WRITE  (-9998 -> 0)
+# --------------------------------------------------------------------
+sentinel_mode <- "threshold"  # "exact" or "threshold"
+sentinel_val  <- -9998
+sentinel_thr  <- -9990        # used only if mode == "threshold"
+
+# quick diagnostic: count sentinel-ish values per numeric column (before)
+sentinel_counts_before <- hydro_temp_data %>%
+  summarise(across(
+    where(is.numeric),
+    ~ if (sentinel_mode == "exact") sum(.x == sentinel_val, na.rm = TRUE) else sum(.x <= sentinel_thr, na.rm = TRUE)
+  ))
+
+cat("\n=== Sentinel counts BEFORE replacement (numeric cols) ===\n")
+print(sentinel_counts_before %>% tidyr::pivot_longer(everything(), names_to = "col", values_to = "n_bad") %>%
+        filter(n_bad > 0) %>% arrange(desc(n_bad)))
+
+# replace sentinels -> 0
+hydro_temp_data <- hydro_temp_data %>%
+  mutate(across(
+    where(is.numeric),
+    ~ if (sentinel_mode == "exact") {
+        dplyr::if_else(.x == sentinel_val, 0, .x)
+      } else {
+        dplyr::if_else(.x <= sentinel_thr, 0, .x)
+      }
+  ))
+
+# quick diagnostic: count sentinel-ish values per numeric column (after)
+sentinel_counts_after <- hydro_temp_data %>%
+  summarise(across(
+    where(is.numeric),
+    ~ if (sentinel_mode == "exact") sum(.x == sentinel_val, na.rm = TRUE) else sum(.x <= sentinel_thr, na.rm = TRUE)
+  ))
+
+cat("\n=== Sentinel counts AFTER replacement (numeric cols) ===\n")
+print(sentinel_counts_after %>% tidyr::pivot_longer(everything(), names_to = "col", values_to = "n_bad") %>%
+        filter(n_bad > 0) %>% arrange(desc(n_bad)))
+
+# --------------------------------------------------------------------
+# 5) Split + write
+# --------------------------------------------------------------------
+cut_date <- as.Date("2013-01-01")
+
+hydro_temp_analysis <- hydro_temp_data %>% filter(date < cut_date)
+hydro_temp_trainval <- hydro_temp_data %>% filter(date >= cut_date)
+
+write_parquet(
+  hydro_temp_analysis,
+  sub("\\.parquet$", "_analysis_pre2013.parquet", out_path_nodes_temp)
+)
+
+write_parquet(
+  hydro_temp_trainval,
+  sub("\\.parquet$", "_trainval_2013plus.parquet", out_path_nodes_temp)
+)
+
+cat("\nWrote:\n",
+    " - ", sub("\\.parquet$", "_analysis_pre2013.parquet", out_path_nodes_temp), "\n",
+    " - ", sub("\\.parquet$", "_trainval_2013plus.parquet", out_path_nodes_temp), "\n", sep="")
 
 
 ```
 
 
+```{r}
+n_distinct(flowlines$comid)
+```
 

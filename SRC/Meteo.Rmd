@@ -26,7 +26,7 @@ basins <- st_read(basins_path, quiet = TRUE)
 
 ```{r}
 # set time window of interest
-start_date <- "2024-01-01" 
+start_date <- "1984-01-01" 
 end_date   <- "2025-09-10"   # adjust as needed
 
 #set parameters to retrieve

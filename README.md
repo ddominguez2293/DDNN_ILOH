@@ -10,7 +10,6 @@ This script initializes the spatial domain for the project by downloading and bu
 ## `Streamflow.Rmd`
 This R Markdown script retrieves and cleans daily streamflow records for all USGS gages that have been snapped to NHDPlus COMIDs in the Illinois River Basin. Using the `sites_with_comid.shp` layer produced by `catchments.Rmd`, it queries NWIS daily values for parameter 00060 (streamflow), standardizes column names, converts flow from cubic feet per second to cubic meters per second, and joins each time series to its corresponding COMID. The resulting dataset is saved as `data/daily_drivers/q_obs.parquet`, and the script includes basic quality-control visualizations of data gaps and streamflow distributions to check for missingness and unit sanity.
 
-
 ## `Catchments.Rmd`
 This R Markdown workflow builds the core hydrologic geospatial layer for the Illinois River Basin. Using the shared paths from `Functions_Paths.R`, it pulls NHDPlus flowlines and catchments for the basin AOI, checks for routing issues (orphan COMIDs), and saves cleaned flowlines and catchments as GeoPackages. It then identifies candidate USGS sites with discharge, temperature, and chlorophyll-a data, snaps them to the nearest flowlines, writes the site layer to disk, and finally delineates full upstream basins for all catchment COMIDs using NLDI, producing a basin dataset that can be used in subsequent modeling and driver-generation scripts.
 

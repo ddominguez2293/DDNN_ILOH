@@ -1,0 +1,37 @@
+---
+title: "data_viz"
+author: "daniel dominguez"
+date: "2026-02-02"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(dplyr)
+library(arrow)
+library(lubridate)
+
+pred_con <- read_parquet(pred_con_path) %>%
+  mutate(
+    date  = as.Date(date),          # converts if it's already Date/POSIXct/character
+    comid = as.integer(comid)
+  )
+
+target_date <- as.Date("2012-01-01")
+
+pred_con_filter <- pred_con %>%
+  filter(date == target_date)
+
+
+```
+
+```{r}
+obs_by_comid <- pred_con %>%
+  count(comid, name = "n_obs") %>%
+  arrange(desc(n_obs))
+
+obs_by_comid
+
+```
+

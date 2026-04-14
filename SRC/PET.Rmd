@@ -24,6 +24,8 @@ drivers_daily <- drivers_daily %>%
 ```
 
 ```{r}
+catchments <- st_read(catchment_path, quiet = TRUE)
+
 # Extract latitude for each catchment
 # Assumes catchments sf object has centroids for latitude
 
@@ -53,30 +55,20 @@ compute_Ra <- function(lat, DOY) {
   Ra_MJ * 0.408
 }
 
-# Ensure optional columns exist (so slide_* below won't error if basin fields are absent)
-if (!"bsn_pr" %in% names(drivers_daily))  drivers_daily$bsn_pr  <- NA_real_
-if (!"bsn_tmax_c" %in% names(drivers_daily)) drivers_daily$bsn_tmax_c <- NA_real_
-if (!"bsn_tmin_c" %in% names(drivers_daily)) drivers_daily$bsn_tmin_c <- NA_real_
-if (!"bsn_tmean_c" %in% names(drivers_daily)) drivers_daily$bsn_tmean_c <- NA_real_
 
 # Compute PET (Hargreaves) for catchments and basins, if inputs exist
 drivers_daily <- drivers_daily %>%
-  rowwise() %>%
   mutate(
     Ra = compute_Ra(lat, DOY),
 
-    # Catchment PET (uses tmax_c/tmin_c/tmean_c if present)
-    PET = if ("tmean_c" %in% names(.) && "tmax_c" %in% names(.) && "tmin_c" %in% names(.))
-      0.0023 * (tmean_c + 17.8) * sqrt(pmax(tmax_c - tmin_c, 0)) * Ra
-    else NA_real_,
+    PET = 0.0023 * (tmean_c + 17.8) *
+      sqrt(pmax(tmax_c - tmin_c, 0)) * Ra,
 
-    # Basin PET (uses bsn_tmax_c/bsn_tmin_c/bsn_tmean_c if present)
-    bsn_PET = if ("bsn_tmean_c" %in% names(.) && "bsn_tmax_c" %in% names(.) && "bsn_tmin_c" %in% names(.))
-      0.0023 * (bsn_tmean_c + 17.8) * sqrt(pmax(bsn_tmax_c - bsn_tmin_c, 0)) * Ra
-    else NA_real_
-  ) %>%
-  ungroup()
+    bsn_PET = 0.0023 * (bsn_tmean_c + 17.8) *
+      sqrt(pmax(bsn_tmax_c - bsn_tmin_c, 0)) * Ra
+  )
 
+head(drivers_daily)
 ```
 
 ```{r}
@@ -94,6 +86,7 @@ drivers_daily <- drivers_daily %>%
 
 ```{r}
 write_feather(drivers_daily, daily_drivers_out)
+head(drivers_daily)
 ```
 
 

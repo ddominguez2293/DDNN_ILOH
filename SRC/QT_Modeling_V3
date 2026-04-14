@@ -1,0 +1,794 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+DDNN_QT_modeling_fullbasin_LSTM_ATTENTION_OPTION_A.py
+
+Option A (recommended): KEEP rectangular [date x comid] grid for convenience,
+but DO NOT treat missing targets as zeros.
+
+Key changes vs your current version:
+1) We preserve masks for target availability:
+   - q_avail_raw: Q_COL is not null (and not sentinel) at that (date, comid)
+   - temp_avail_raw: T_COL is not null (and not sentinel) at that (date, comid)
+
+2) Scaling:
+   - scaler_X is fit on training rows (features) with nulls filled to 0.0 (same as before)
+   - scaler_y is fit ONLY on observed target rows in training:
+       * Q fitted only where q_avail_raw is True
+       * T fitted only where temp_avail_raw is True
+   - Missing targets are filled with 0.0 ONLY for storage after scaling,
+     but they are masked out in the loss (so they do not contribute).
+
+3) Loss:
+   - Q weighted NSE term computed ONLY over q_mask (availability) AND q_true>eps
+   - T MSE computed ONLY over temp availability mask
+
+Everything else (Polars ingestion, dataset windows, evaluation/plots, saving artifacts)
+remains consistent with your script.
+"""
+
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import numpy as np
+import polars as pl
+import torch
+import torch.nn as nn
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import Dataset, DataLoader, Subset
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import matplotlib.pyplot as plt
+import joblib
+
+# -------------------------
+# Config
+# -------------------------
+NODES_PATH = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/daily_drivers/hydro_temp_data_trainval_2013plus.parquet"
+
+SPLIT_DATE   = np.datetime64("2025-01-01")  # train < SPLIT_DATE; test >= SPLIT_DATE
+LOOKBACK     = 7
+
+H_LSTM       = 64
+LSTM_LAYERS  = 1
+LSTM_DROPOUT = 0.2
+
+EPOCHS       = 200
+LR           = 1e-4
+BATCH_SIZE   = 1   
+PATIENCE     = 20
+
+# Features (must exist in nodes parquet)
+BASE_FEATURES = [
+    "pr", "srad", "vs", "vpd", "sph",
+    "tmax_c", "tmin_c", "tmean_c",
+    "rmin", "rmax", "Ra", "bsn_pr"
+]
+STATIC_FEATURES   = ["area_m2", "Slope", "LengthKM", "streamorde"]
+SEASONAL_FEATURES = ["DOY_sin", "DOY_cos"]
+FEATURES = BASE_FEATURES + SEASONAL_FEATURES + STATIC_FEATURES
+
+Q_COL   = "q_m3s_obs"
+T_COL   = "water_temp_C"
+TARGETS = [Q_COL, T_COL]
+
+# weights for [Q, T] terms in the mixed loss
+TASK_WEIGHTS = torch.tensor([0.7, 0.3], dtype=torch.float32)
+
+TARGET_COMID_FOR_PLOTS = 14787569
+
+SAVE_DIR = "/Users/danieldominguez/Documents/Code/DDNN_ILOH/data/models_fullbasin"
+FEATURES_PATH = os.path.join(SAVE_DIR, "features.pkl")
+
+SENTINEL_MISS = -9998.0
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# -------------------------
+# Helpers
+# -------------------------
+def ensure_dir(p: str | Path) -> None:
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+def print_header(title: str) -> None:
+    print("\n" + "=" * 70)
+    print(title)
+    print("=" * 70)
+
+def cast_nodes_lazy(nodes_path: str) -> pl.LazyFrame:
+    return (
+        pl.scan_parquet(nodes_path)
+        .with_columns([
+            pl.col("comid").cast(pl.Int32),
+            pl.col("date").cast(pl.Date),
+        ])
+    )
+
+def replace_sentinel_with_null(lf: pl.LazyFrame, cols: list[str], sentinel: float = SENTINEL_MISS) -> pl.LazyFrame:
+    exprs = []
+    for c in cols:
+        exprs.append(
+            pl.when(pl.col(c) == sentinel)
+              .then(None)
+              .otherwise(pl.col(c))
+              .alias(c)
+        )
+    return lf.with_columns(exprs)
+
+def assert_required_columns(lf: pl.LazyFrame, required: set[str]) -> None:
+    cols = set(lf.collect_schema().names())
+    missing = sorted(list(required - cols))
+    if missing:
+        raise ValueError("Missing required columns in nodes parquet:\n" + "\n".join(missing))
+
+
+# -------------------------
+# Visualization helpers
+# -------------------------
+def safe_parity_scatter(true_vals, pred_vals, title, xlabel, ylabel, mask=None, max_points=250_000):
+    true_vals = np.asarray(true_vals).ravel()
+    pred_vals = np.asarray(pred_vals).ravel()
+
+    if mask is not None:
+        mask = np.asarray(mask).ravel().astype(bool)
+        true_vals = true_vals[mask]
+        pred_vals = pred_vals[mask]
+
+    valid = np.isfinite(true_vals) & np.isfinite(pred_vals)
+    true_vals = true_vals[valid]
+    pred_vals = pred_vals[valid]
+
+    n = true_vals.size
+    if n > max_points:
+        idx = np.random.choice(n, size=max_points, replace=False)
+        true_vals = true_vals[idx]
+        pred_vals = pred_vals[idx]
+
+    plt.figure(figsize=(5, 5))
+    plt.scatter(true_vals, pred_vals, alpha=0.3, s=10)
+    mx = max(true_vals.max(), pred_vals.max())
+    mn = min(true_vals.min(), pred_vals.min())
+    plt.plot([mn, mx], [mn, mx], linestyle="--")
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+def plot_obs_histograms_logy_from_arrays(obs_q_phys, obs_t_phys, mask_t_flat=None,
+                                        bins_q=250, bins_t=200, title_suffix="(all observations)"):
+    q = np.asarray(obs_q_phys).ravel()
+    q = q[np.isfinite(q)]
+
+    plt.figure(figsize=(9, 4))
+    plt.hist(q, bins=bins_q)
+    plt.yscale("log")
+    plt.ylim(bottom=1)
+    plt.title(f"Observed Discharge Histogram — log y {title_suffix}")
+    plt.xlabel("Observed Q (m³/s)")
+    plt.ylabel("Count (log scale)")
+    plt.tight_layout()
+    plt.show()
+
+    t = np.asarray(obs_t_phys).ravel()
+    if mask_t_flat is not None:
+        mask_t_flat = np.asarray(mask_t_flat).ravel().astype(bool)
+        t = t[mask_t_flat]
+
+    t = t[np.isfinite(t)]
+
+    plt.figure(figsize=(9, 4))
+    plt.hist(t, bins=bins_t)
+    plt.yscale("log")
+    plt.ylim(bottom=1)
+    plt.title(f"Observed Water Temperature Histogram — log y {title_suffix}")
+    plt.xlabel("Observed Temp (°C)")
+    plt.ylabel("Count (log scale)")
+    plt.tight_layout()
+    plt.show()
+
+
+# -------------------------
+# Loss helpers (masked targets)
+# -------------------------
+Q_EPS = 1e-6
+
+def nse_mse_mixed_loss(yhat, ytrue, w, q_mask=None, t_mask=None, eps=1e-8):
+    """
+    yhat, ytrue: [N, 2] (scaled space)
+    q_mask: [N] bool, True where Q is observed at this time step
+    t_mask: [N] bool, True where Temp is observed at this time step
+
+    Q loss: weighted NSE-like term computed only where q_mask is True AND q_true>eps
+    T loss: MSE computed only where t_mask is True
+    """
+    w = w.to(yhat.device)
+
+    # ---- Q: masked weighted NSE term ----
+    q_pred = yhat[:, 0]
+    q_true = ytrue[:, 0]
+
+    if q_mask is None:
+        q_mask = torch.ones_like(q_true, dtype=torch.bool)
+
+    # Also require q_true>eps to avoid "fake zeros" even if present
+    q_use = q_mask & (q_true > Q_EPS)
+
+    if q_use.sum() == 0:
+        nse_term_q = torch.tensor(0.0, device=yhat.device)
+        w_q = torch.tensor([0.0, 1.0], device=yhat.device)  # effectively ignore Q
+    else:
+        q_true_u = q_true[q_use]
+        q_pred_u = q_pred[q_use]
+        q_mean = torch.mean(q_true_u)
+        num_q = torch.sum((q_true_u - q_pred_u) ** 2)
+        den_q = torch.sum((q_true_u - q_mean) ** 2) + eps
+        nse_term_q = num_q / den_q
+        w_q = w
+
+    # ---- Temp: masked MSE ----
+    if t_mask is None:
+        t_mask = torch.ones_like(q_true, dtype=torch.bool)
+
+    if t_mask.sum() == 0:
+        mse_t = torch.tensor(0.0, device=yhat.device)
+        w_use = torch.tensor([1.0, 0.0], device=yhat.device) if (q_use.sum() > 0) else torch.tensor([0.0, 1.0], device=yhat.device)
+    else:
+        t_pred = yhat[t_mask, 1]
+        t_true = ytrue[t_mask, 1]
+        mse_t = torch.mean((t_true - t_pred) ** 2)
+        w_use = w_q
+
+    w_use = w_use / (w_use.sum() + eps)
+    total = w_use[0] * nse_term_q + w_use[1] * mse_t
+    return total, nse_term_q.detach(), mse_t.detach()
+
+
+# -------------------------
+# Dataset + Dataloader
+# -------------------------
+class NodeSeqDataset(Dataset):
+    """
+    Produces:
+      x_win: [N, LOOKBACK, F]
+      y_t  : [N, 2]
+      q_m  : [N] bool  (Q availability mask at prediction time)
+      t_m  : [N] bool  (Temp availability mask at prediction time)
+    """
+    def __init__(self, X_TNF, Y_TN2, Qmask_TN, Tmask_TN, lookback):
+        self.X = X_TNF
+        self.Y = Y_TN2
+        self.QM = Qmask_TN
+        self.TM = Tmask_TN
+        self.lb = lookback
+
+    def __len__(self):
+        return self.X.shape[0] - self.lb
+
+    def __getitem__(self, idx):
+        t = idx + self.lb
+        t0 = t - self.lb + 1
+        t1 = t + 1
+
+        x_win = self.X[t0:t1, :, :]                               # [lb, N, F]
+        x_win = np.transpose(x_win, (1, 0, 2)).astype(np.float32)  # [N, lb, F]
+        y_t   = self.Y[t, :, :].astype(np.float32)                 # [N, 2]
+        q_m   = self.QM[t, :].astype(bool)                         # [N]
+        t_m   = self.TM[t, :].astype(bool)                         # [N]
+        return (
+            torch.from_numpy(x_win),
+            torch.from_numpy(y_t),
+            torch.from_numpy(q_m),
+            torch.from_numpy(t_m),
+        )
+
+
+# -------------------------
+# Model: LSTM + Temporal Attention, two-output head
+# -------------------------
+class TemporalAttention(nn.Module):
+    """
+    Attention over time dimension for each node independently.
+    Input:  h_seq [N, L, H]
+    Output: ctx  [N, H]
+    """
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.score = nn.Linear(hidden_dim, 1)
+
+    def forward(self, h_seq: torch.Tensor) -> torch.Tensor:
+        logits = self.score(h_seq).squeeze(-1)           # [N, L]
+        alpha  = torch.softmax(logits, dim=1)            # [N, L]
+        ctx    = torch.sum(h_seq * alpha.unsqueeze(-1), dim=1)  # [N, H]
+        return ctx
+
+
+class LSTM_Attn_MTL(nn.Module):
+    def __init__(self, in_dim, lstm_hidden, lstm_layers, lstm_dropout, out_dim=2):
+        super().__init__()
+        self.lstm = nn.LSTM(
+            input_size=in_dim,
+            hidden_size=lstm_hidden,
+            num_layers=lstm_layers,
+            dropout=(lstm_dropout if lstm_layers > 1 else 0.0),
+            batch_first=True
+        )
+        self.drop = nn.Dropout(lstm_dropout)
+        self.attn = TemporalAttention(lstm_hidden)
+        self.head = nn.Linear(lstm_hidden, out_dim)
+
+    def forward(self, x_win: torch.Tensor) -> torch.Tensor:
+        # x_win: [N, L, F]
+        h_seq, _ = self.lstm(x_win)  # [N, L, H]
+        h_seq = self.drop(h_seq)
+        ctx = self.attn(h_seq)       # [N, H]
+        return self.head(ctx)        # [N, 2]
+
+
+# -------------------------
+# Load nodes (Polars) + sanity
+# -------------------------
+ensure_dir(SAVE_DIR)
+
+print_header("LOAD NODES (Polars scan)")
+nodes_lf = cast_nodes_lazy(NODES_PATH)
+
+required_cols = {"comid", "date", Q_COL, T_COL} | set(FEATURES)
+assert_required_columns(nodes_lf, required_cols)
+
+# Replace sentinel with null for FEATURES+TARGETS first (so availability flags are correct)
+nodes_lf = replace_sentinel_with_null(nodes_lf, FEATURES + TARGETS, sentinel=SENTINEL_MISS)
+
+# Availability flags AFTER sentinel replacement
+nodes_lf = nodes_lf.with_columns([
+    pl.col(Q_COL).is_not_null().alias("q_avail_raw"),
+    pl.col(T_COL).is_not_null().alias("temp_avail_raw"),
+])
+
+# global summary (fast; no full collect)
+summary = (
+    nodes_lf.select([
+        pl.len().alias("n_rows"),
+        pl.col("comid").n_unique().alias("n_comids"),
+        pl.col("date").min().alias("min_date"),
+        pl.col("date").max().alias("max_date"),
+        pl.col(Q_COL).is_not_null().mean().alias("pct_rows_with_q"),
+        pl.col("comid").filter(pl.col(Q_COL).is_not_null()).n_unique().alias("n_comids_with_any_q"),
+        pl.col(T_COL).is_not_null().mean().alias("pct_rows_with_temp"),
+        pl.col("comid").filter(pl.col(T_COL).is_not_null()).n_unique().alias("n_comids_with_any_temp"),
+    ]).collect()
+)
+print(summary)
+
+# Persist FEATURES order (order-critical)
+joblib.dump(FEATURES, FEATURES_PATH)
+print(f"\nUsing explicit FEATURES (n={len(FEATURES)}), saved to: {FEATURES_PATH}")
+print(FEATURES)
+
+# -------------------------
+# Validate rectangular grid (date x comid) BEFORE reshape
+# -------------------------
+print_header("GRID SANITY (rectangular date x comid check)")
+grid_stats = (
+    nodes_lf.select([
+        pl.col("date").n_unique().alias("n_dates"),
+        pl.col("comid").n_unique().alias("n_comids"),
+        pl.len().alias("n_rows"),
+    ]).collect()
+)
+n_dates = int(grid_stats["n_dates"][0])
+n_comids = int(grid_stats["n_comids"][0])
+n_rows = int(grid_stats["n_rows"][0])
+expected = n_dates * n_comids
+print(grid_stats)
+print(f"Expected rows if rectangular = n_dates*n_comids = {n_dates}*{n_comids} = {expected:,}")
+
+if n_rows != expected:
+    print("\nWARNING: nodes table is not a perfect rectangular grid.")
+    print("Attempting to repair by aggregating to one row per (date, comid) ...")
+
+    agg_exprs = []
+    for c in FEATURES + TARGETS:
+        agg_exprs.append(pl.col(c).mean().alias(c))
+    agg_exprs.append(pl.col("q_avail_raw").any().alias("q_avail_raw"))
+    agg_exprs.append(pl.col("temp_avail_raw").any().alias("temp_avail_raw"))
+
+    nodes_lf = (
+        nodes_lf
+        .group_by(["date", "comid"])
+        .agg(agg_exprs)
+    )
+
+    grid_stats2 = (
+        nodes_lf.select([
+            pl.col("date").n_unique().alias("n_dates"),
+            pl.col("comid").n_unique().alias("n_comids"),
+            pl.len().alias("n_rows"),
+        ]).collect()
+    )
+    n_dates = int(grid_stats2["n_dates"][0])
+    n_comids = int(grid_stats2["n_comids"][0])
+    n_rows = int(grid_stats2["n_rows"][0])
+    expected = n_dates * n_comids
+    print("\nAfter repair:")
+    print(grid_stats2)
+    print(f"Expected rows if rectangular = {expected:,}")
+    if n_rows != expected:
+        raise RuntimeError(
+            "Still not rectangular after aggregation. "
+            "This means you have missing comid-days (not just duplicates). "
+            "Fix upstream pipeline so drivers exist for every comid-day."
+        )
+
+print("\nOK: rectangular grid confirmed. Proceeding to sort + reshape.")
+
+# -------------------------
+# Collect + reshape to tensors [T, N, F]
+# -------------------------
+print_header("COLLECT + RESHAPE to tensors [T,N,F] (RAM heavy)")
+nodes_sorted = (
+    nodes_lf
+    .sort(["date", "comid"])
+    .select(["date", "comid"] + FEATURES + TARGETS + ["q_avail_raw", "temp_avail_raw"])
+    .collect(streaming=True)
+)
+
+dates = nodes_sorted["date"].unique().to_numpy()
+dates.sort()
+comids = nodes_sorted["comid"].unique().to_numpy()
+comids.sort()
+
+Tsteps = dates.shape[0]
+N = comids.shape[0]
+Fdim = len(FEATURES)
+
+print(f"Tsteps={Tsteps:,} days | N={N:,} COMIDs | F={Fdim}")
+
+X_flat = nodes_sorted.select(FEATURES).to_numpy().astype(np.float32)
+
+# IMPORTANT: keep targets as NaN where missing (do not fill with zero here)
+Y_flat = nodes_sorted.select(TARGETS).to_numpy().astype(np.float32)
+
+Qm_flat = nodes_sorted["q_avail_raw"].to_numpy().astype(bool)
+Tm_flat = nodes_sorted["temp_avail_raw"].to_numpy().astype(bool)
+
+X_TNF = X_flat.reshape(Tsteps, N, Fdim)
+Y_TN2 = Y_flat.reshape(Tsteps, N, 2)
+
+Qmask_TN = Qm_flat.reshape(Tsteps, N).astype(bool)
+Tmask_TN = Tm_flat.reshape(Tsteps, N).astype(bool)
+
+all_comids = comids.astype(np.int64)
+comid_to_idx = {int(c): i for i, c in enumerate(all_comids)}
+
+# -------------------------
+# Train/test split (by time)
+# -------------------------
+t_dates = dates[LOOKBACK:]
+train_indices = [i for i, d in enumerate(t_dates) if d < SPLIT_DATE]
+test_indices  = [i for i, d in enumerate(t_dates) if d >= SPLIT_DATE]
+
+if len(train_indices) == 0 or len(test_indices) == 0:
+    raise ValueError("No train or test indices after applying LOOKBACK and SPLIT_DATE.")
+
+print(f"Training on {len(train_indices)} time steps (< {str(SPLIT_DATE)}); "
+      f"testing on {len(test_indices)} time steps (≥ {str(SPLIT_DATE)}).")
+
+# -------------------------
+# Scaling (train-only fit; targets fit ONLY on observed rows)
+# -------------------------
+print_header("SCALING (train-only fit; y fit on observed targets only)")
+
+train_mask_rows = np.array([d < SPLIT_DATE for d in dates], dtype=bool)
+if train_mask_rows.sum() == 0:
+    raise ValueError("No training rows found before SPLIT_DATE.")
+
+# --- X scaler: same approach as before (fill null/nan to 0 for features)
+scaler_X = MinMaxScaler()
+fit_X = np.nan_to_num(X_TNF[train_mask_rows].reshape(-1, Fdim), nan=0.0)
+scaler_X.fit(fit_X)
+
+X_TNF = scaler_X.transform(np.nan_to_num(X_TNF.reshape(-1, Fdim), nan=0.0)).reshape(Tsteps, N, Fdim).astype(np.float32)
+
+# --- y scaler: fit ONLY on observed targets in TRAIN period
+#     We build a [n_obs, 2] array for fitting. For rows where one task is missing,
+#     we insert the observed value and set the other column to 0.0; then we fit
+#     each column using only its observed subset via separate scalers to avoid bias.
+scaler_y_q = MinMaxScaler()
+scaler_y_t = MinMaxScaler()
+
+Y_train = Y_TN2[train_mask_rows]  # [Ttrain, N, 2]
+
+# Fit Q scaler on observed Q only
+q_obs = Y_train[:, :, 0][Qmask_TN[train_mask_rows]].reshape(-1, 1)
+if q_obs.size == 0:
+    raise ValueError("No observed Q values in training period (check Q_COL and SPLIT_DATE).")
+scaler_y_q.fit(q_obs.astype(np.float32))
+
+# Fit T scaler on observed Temp only
+t_obs = Y_train[:, :, 1][Tmask_TN[train_mask_rows]].reshape(-1, 1)
+if t_obs.size == 0:
+    print("WARNING: No observed temperature values in training period. Temp head will be effectively unused.")
+    # Fit on a dummy value to keep code running; loss will mask T out anyway.
+    scaler_y_t.fit(np.array([[0.0]], dtype=np.float32))
+else:
+    scaler_y_t.fit(t_obs.astype(np.float32))
+
+# Transform Y into scaled space with masks; missing entries get filled to 0.0 AFTER scaling
+Y_scaled = np.zeros_like(Y_TN2, dtype=np.float32)
+
+# Q column transform where observed
+q_all = Y_TN2[:, :, 0]
+q_scaled_all = np.zeros_like(q_all, dtype=np.float32)
+q_scaled_all[Qmask_TN] = scaler_y_q.transform(q_all[Qmask_TN].reshape(-1, 1)).reshape(-1).astype(np.float32)
+Y_scaled[:, :, 0] = q_scaled_all
+
+# T column transform where observed
+t_all = Y_TN2[:, :, 1]
+t_scaled_all = np.zeros_like(t_all, dtype=np.float32)
+if t_obs.size > 0:
+    t_scaled_all[Tmask_TN] = scaler_y_t.transform(t_all[Tmask_TN].reshape(-1, 1)).reshape(-1).astype(np.float32)
+Y_scaled[:, :, 1] = t_scaled_all
+
+Y_TN2 = Y_scaled
+
+# Save scalers
+ensure_dir(SAVE_DIR)
+joblib.dump(scaler_X, os.path.join(SAVE_DIR, "scaler_X.pkl"))
+joblib.dump({"q": scaler_y_q, "t": scaler_y_t}, os.path.join(SAVE_DIR, "scaler_y_by_task.pkl"))
+joblib.dump(FEATURES, FEATURES_PATH)
+
+# -------------------------
+# Dataset + loaders
+# -------------------------
+dataset = NodeSeqDataset(X_TNF, Y_TN2, Qmask_TN, Tmask_TN, LOOKBACK)
+train_ds = Subset(dataset, train_indices)
+test_ds  = Subset(dataset, test_indices)
+
+train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=False)
+test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE, shuffle=False)
+
+# -------------------------
+# Model + optim
+# -------------------------
+model = LSTM_Attn_MTL(
+    in_dim=len(FEATURES),
+    lstm_hidden=H_LSTM,
+    lstm_layers=LSTM_LAYERS,
+    lstm_dropout=LSTM_DROPOUT,
+    out_dim=2
+).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=6)
+
+# -------------------------
+# Training loop
+# -------------------------
+print_header("TRAINING")
+best_val = float("inf")
+best_state = None
+epochs_no_improve = 0
+
+print(f"Training on {len(train_ds)} steps; validating on {len(test_ds)} steps.")
+for epoch in range(1, EPOCHS + 1):
+    model.train()
+    tr_losses = []; tr_q = []; tr_t = []
+
+    for x_win, y_t, q_m, t_m in train_loader:
+        x_win = x_win.squeeze(0).to(device).float()  # [N, L, F]
+        y_t   = y_t.squeeze(0).to(device).float()    # [N, 2]
+        q_m   = q_m.squeeze(0).to(device)            # [N]
+        t_m   = t_m.squeeze(0).to(device)            # [N]
+
+        optimizer.zero_grad()
+        yhat = model(x_win)  # [N, 2]
+        loss, lq, lt = nse_mse_mixed_loss(yhat, y_t, TASK_WEIGHTS, q_mask=q_m, t_mask=t_m)
+        loss.backward()
+        optimizer.step()
+
+        tr_losses.append(loss.item()); tr_q.append(lq.item()); tr_t.append(lt.item())
+
+    model.eval()
+    va_losses = []; va_q = []; va_t = []
+    with torch.no_grad():
+        for x_win, y_t, q_m, t_m in test_loader:
+            x_win = x_win.squeeze(0).to(device).float()
+            y_t   = y_t.squeeze(0).to(device).float()
+            q_m   = q_m.squeeze(0).to(device)
+            t_m   = t_m.squeeze(0).to(device)
+
+            yhat = model(x_win)
+            loss, lq, lt = nse_mse_mixed_loss(yhat, y_t, TASK_WEIGHTS, q_mask=q_m, t_mask=t_m)
+            va_losses.append(loss.item()); va_q.append(lq.item()); va_t.append(lt.item())
+
+    tr_mean = float(np.mean(tr_losses)); va_mean = float(np.mean(va_losses))
+    print(f"Epoch {epoch:03d}/{EPOCHS} | Train mix: {tr_mean:.6f} "
+          f"(Q NSEterm {np.mean(tr_q):.6f}, T MSE {np.mean(tr_t):.6f}) "
+          f"| Val mix: {va_mean:.6f} (Q NSEterm {np.mean(va_q):.6f}, T MSE {np.mean(va_t):.6f})")
+
+    scheduler.step(va_mean)
+
+    if va_mean + 1e-6 < best_val:
+        best_val = va_mean
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        epochs_no_improve = 0
+    else:
+        epochs_no_improve += 1
+        if epochs_no_improve >= PATIENCE:
+            print(f"Early stopping at epoch {epoch}")
+            break
+
+if best_state is not None:
+    model.load_state_dict(best_state)
+    model.to(device)
+
+# -------------------------
+# Inverse transforms (task-specific scalers)
+# -------------------------
+def inverse_two_columns_by_task(arr_scaled_TN2: np.ndarray) -> np.ndarray:
+    """
+    arr_scaled_TN2: [T, N, 2] in scaled space
+    Returns:        [T, N, 2] in physical units (but only valid where masks are True)
+    Missing entries will be inverse-transformed from 0.0; you MUST use masks when evaluating.
+    """
+    out = np.zeros_like(arr_scaled_TN2, dtype=np.float32)
+
+    q_flat = arr_scaled_TN2[:, :, 0].reshape(-1, 1)
+    t_flat = arr_scaled_TN2[:, :, 1].reshape(-1, 1)
+
+    out[:, :, 0] = scaler_y_q.inverse_transform(q_flat).reshape(arr_scaled_TN2.shape[0], arr_scaled_TN2.shape[1]).astype(np.float32)
+    out[:, :, 1] = scaler_y_t.inverse_transform(t_flat).reshape(arr_scaled_TN2.shape[0], arr_scaled_TN2.shape[1]).astype(np.float32)
+    return out
+
+def nse_numpy(sim, obs):
+    num = np.sum((sim - obs) ** 2)
+    den = np.sum((obs - np.mean(obs)) ** 2) + 1e-12
+    return 1.0 - num / den
+
+def rmse_numpy(sim, obs):
+    return float(np.sqrt(np.mean((sim - obs) ** 2)))
+
+def mae_numpy(sim, obs):
+    return float(np.mean(np.abs(sim - obs)))
+
+# -------------------------
+# Evaluation in physical units (MASKED!)
+# -------------------------
+print_header("EVALUATION (masked; original units where observed)")
+model.eval()
+
+preds_scaled = []
+obs_scaled   = []
+q_masks      = []
+t_masks      = []
+
+with torch.no_grad():
+    for x_win, y_t, q_m, t_m in test_loader:
+        x_win = x_win.squeeze(0).to(device).float()
+        y_t   = y_t.squeeze(0).to(device).float()
+
+        yhat = model(x_win).detach().cpu().numpy()  # [N, 2]
+        preds_scaled.append(yhat)
+        obs_scaled.append(y_t.detach().cpu().numpy())
+        q_masks.append(q_m.squeeze(0).cpu().numpy().astype(bool))
+        t_masks.append(t_m.squeeze(0).cpu().numpy().astype(bool))
+
+preds_scaled = np.stack(preds_scaled, axis=0)  # [T_test, N, 2]
+obs_scaled   = np.stack(obs_scaled,   axis=0)  # [T_test, N, 2]
+q_masks      = np.stack(q_masks,      axis=0)  # [T_test, N]
+t_masks      = np.stack(t_masks,      axis=0)  # [T_test, N]
+
+pred_phys = inverse_two_columns_by_task(preds_scaled)
+obs_phys  = inverse_two_columns_by_task(obs_scaled)
+
+# Flatten for metrics, but apply masks
+pred_q = pred_phys[:, :, 0].ravel()
+true_q = obs_phys[:, :, 0].ravel()
+pred_t = pred_phys[:, :, 1].ravel()
+true_t = obs_phys[:, :, 1].ravel()
+
+mask_q = q_masks.ravel().astype(bool)
+mask_t = t_masks.ravel().astype(bool)
+
+if mask_q.any():
+    q_nse  = nse_numpy(pred_q[mask_q], true_q[mask_q])
+    q_rmse = rmse_numpy(pred_q[mask_q], true_q[mask_q])
+    q_mae  = mae_numpy(pred_q[mask_q],  true_q[mask_q])
+else:
+    q_nse = q_rmse = q_mae = np.nan
+
+if mask_t.any():
+    t_nse  = nse_numpy(pred_t[mask_t], true_t[mask_t])
+    t_rmse = rmse_numpy(pred_t[mask_t], true_t[mask_t])
+    t_mae  = mae_numpy(pred_t[mask_t],  true_t[mask_t])
+else:
+    t_nse = t_rmse = t_mae = np.nan
+
+print("\n=== Test Metrics (original units; masked to observed targets) ===")
+print(f"Q    -> NSE: {q_nse:.4f} | RMSE: {q_rmse:.4f} | MAE: {q_mae:.4f} | n={mask_q.sum():,}")
+print(f"Temp -> NSE: {t_nse:.4f} | RMSE: {t_rmse:.4f} | MAE: {t_mae:.4f} | n={mask_t.sum():,}")
+
+# -------------------------
+# Visualizations (single COMID + parity + obs hist) — masked
+# -------------------------
+print_header("VISUALIZATIONS")
+
+# Single COMID time series (test period)
+if TARGET_COMID_FOR_PLOTS not in comid_to_idx:
+    raise ValueError(f"COMID {TARGET_COMID_FOR_PLOTS} not found in dataset.")
+catch_idx = comid_to_idx[TARGET_COMID_FOR_PLOTS]
+
+pred_q_series = pred_phys[:, catch_idx, 0]
+true_q_series = obs_phys[:,  catch_idx, 0]
+pred_t_series = pred_phys[:, catch_idx, 1]
+true_t_series = obs_phys[:,  catch_idx, 1]
+
+q_m_series = q_masks[:, catch_idx]
+t_m_series = t_masks[:, catch_idx]
+
+plt.figure(figsize=(12, 4))
+plt.plot(true_q_series, label="Observed Q (inv-scaled)", linewidth=2)
+plt.plot(pred_q_series, label="Predicted Q (inv-scaled)", alpha=0.8, linewidth=1.8)
+plt.legend()
+plt.title(f"Hydrograph (Test Period) — COMID {TARGET_COMID_FOR_PLOTS}")
+plt.xlabel("Time steps")
+plt.ylabel("Discharge (m³/s)")
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(12, 4))
+plt.plot(true_t_series, label="Observed Temp (inv-scaled)", linewidth=2)
+plt.plot(pred_t_series, label="Predicted Temp (inv-scaled)", alpha=0.8, linewidth=1.8)
+plt.legend()
+plt.title(f"Water Temperature (Test Period) — COMID {TARGET_COMID_FOR_PLOTS}")
+plt.xlabel("Time steps")
+plt.ylabel("Temperature (°C)")
+plt.tight_layout()
+plt.show()
+
+# Parity plots: mask to observed
+safe_parity_scatter(
+    true_vals=true_q,
+    pred_vals=pred_q,
+    title="Discharge: Observed vs Predicted (All Test Nodes/Times; masked)",
+    xlabel="Observed Q (m³/s)",
+    ylabel="Predicted Q (m³/s)",
+    mask=mask_q
+)
+
+safe_parity_scatter(
+    true_vals=true_t,
+    pred_vals=pred_t,
+    title="Water Temperature: Observed vs Predicted (All Test Nodes/Times; masked)",
+    xlabel="Observed Temp (°C)",
+    ylabel="Predicted Temp (°C)",
+    mask=mask_t
+)
+
+# Observed histograms (log y) in physical units — only observed entries
+plot_obs_histograms_logy_from_arrays(
+    obs_q_phys=true_q[mask_q],
+    obs_t_phys=true_t[mask_t] if mask_t.any() else np.array([], dtype=np.float32),
+    mask_t_flat=None,
+    bins_q=250,
+    bins_t=200,
+    title_suffix="(test set; observed-only)"
+)
+
+# -------------------------
+# Save model + scalers + FEATURES
+# -------------------------
+print_header("SAVE ARTIFACTS")
+ensure_dir(SAVE_DIR)
+
+torch.save(model.state_dict(), os.path.join(SAVE_DIR, "lstm_attn_multitask_q_t_mixedloss_fullbasin_optionA.pth"))
+joblib.dump(scaler_X, os.path.join(SAVE_DIR, "scaler_X.pkl"))
+joblib.dump({"q": scaler_y_q, "t": scaler_y_t}, os.path.join(SAVE_DIR, "scaler_y_by_task.pkl"))
+joblib.dump(FEATURES,  FEATURES_PATH)
+
+print(f"Saved model/scalers/features to:\n  {SAVE_DIR}\n  features: {FEATURES_PATH}")
+print("Saved y scalers (by task) to: scaler_y_by_task.pkl")

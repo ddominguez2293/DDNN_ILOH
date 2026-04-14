@@ -33,7 +33,7 @@ H_GNN        = 64
 GNN_DROPOUT  = 0.2
 GAT_HEADS    = 4
 
-EPOCHS       = 75
+EPOCHS       = 200
 LR           = 1e-4
 BATCH_SIZE   = 1   # each batch = one time step window over all nodes
 PATIENCE     = 20

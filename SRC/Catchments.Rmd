@@ -166,4 +166,8 @@ if (nrow(basins)) {
 }
 ```
 
+```{r}
+# Load previously saved flowlines
+flowlines <- st_read(file.path(nhd_dir, "flowlines.gpkg"), quiet = TRUE)
+```
 

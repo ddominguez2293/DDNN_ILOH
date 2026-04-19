@@ -27,7 +27,7 @@ site_ids <- unique(sites_with_comid$site_no)
 # 2. Pull Daily Streamflow (00060)
 # -------------------------------
 start_date <- "1984-01-01"
-end_date   <- "2025-09-10"
+end_date   <- "2026-04-01"
 
 q_raw <- readNWISdv(
   siteNumbers = site_ids,

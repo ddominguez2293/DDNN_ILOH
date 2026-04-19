@@ -133,7 +133,9 @@ cat("edge_list rows:", nrow(edge_list), " unique comid:", dplyr::n_distinct(edge
 write_parquet(df, out_path_nodes)
 write_parquet(edge_list, out_path_edges)
 
+```
 
-
+```{r}
+drivers_daily_joined <- read_feather(file.path(daily_drivers_dir, "drivers_daily_joined_PET.feather"))
 ```
 

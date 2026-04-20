@@ -61,3 +61,6 @@ rsconnect/
 
 # png
 *.png
+
+#DS_Store
+.DS_Store

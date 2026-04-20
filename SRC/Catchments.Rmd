@@ -1,173 +1,294 @@
 ---
-title: "Catchments"
+title: "Catchments (Q + T joined to COMID, stream order >= 4)"
 output: html_document
-editor_options: 
+editor_options:
   chunk_output_type: console
 ---
 
-```{r}
+STEP 4 of the pipeline (runs after Watertemp.Rmd).
+
+Purpose
+-------
+Build the NHDPlus HR routing layer for the AOI (flowlines + catchments),
+snap every USGS site that appears in the Q+T table to a COMID, and filter
+everything to stream order >= 4 in one pass. No duplicated full-basin
+layers are persisted.
+
+Final outputs (single version of each — these ARE the SO>=4 layers):
+  - `nhd_dir/flowlines.gpkg`          : NHDPlus HR flowlines, SO >= 4, clipped to AOI
+  - `nhd_dir/catchments.gpkg`         : matching catchment polygons (same COMIDs)
+  - `daily_drivers_dir/q_t_comid.parquet` : Q + T daily obs joined to COMID, SO >= 4
+  - `shape_dir/sites_with_comid.csv`  : site_no -> comid lookup for provenance
+
+```{r setup}
 source("SRC/Functions_Paths.R")
+
+library(sf)
+library(dplyr)
+library(arrow)
+library(dataRetrieval)
+library(nhdplusTools)
+
+sf::sf_use_s2(FALSE)
 ```
 
-
-```{r}
-# Load area of interest (Illinois River basin)
+```{r aoi}
+# AOI from Boundaries.py
 aoi <- st_read(basin_shp, quiet = TRUE) %>%
-  st_transform(4326)  # WGS84 for NLDI
-
+  st_transform(4326) %>%
+  st_make_valid()
 ```
 
-```{r}
-# Get nhd flowlines 
-flowlines <- get_nhdplus(AOI = aoi, realization = "flowline")
+```{r nhd-hr-download}
+# Illinois basin = HU4 0712 + 0713
+hu4s        <- c("0712", "0713")
+hr_data_dir <- file.path(nhd_dir, "hr_raw")
+hr_gpkg     <- file.path(nhd_dir, "nhdplushr.gpkg")
 
-# Keep only essential attributes
-flowlines <- flowlines %>%
+dir.create(hr_data_dir, recursive = TRUE, showWarnings = FALSE)
+
+download_nhdplushr(hr_data_dir, hu4s)
+
+hr <- get_nhdplushr(
+  hr_data_dir,
+  layers   = c("NHDFlowline", "NHDPlusCatchment"),
+  out_gpkg = hr_gpkg
+)
+```
+
+```{r flowlines-catchments}
+# HR flowlines clipped to AOI, renamed to lowercase to match the rest of the pipeline
+flowlines <- hr$NHDFlowline %>%
+  st_as_sf() %>%
+  st_transform(4326) %>%
+  rename(
+    comid      = COMID,
+    reachcode  = REACHCODE,
+    gnis_name  = GNIS_Name,
+    lengthkm   = LENGTHKM,
+    areasqkm   = TotDASqKM,
+    slope      = Slope,
+    streamorde = StreamOrde,
+    streamcalc = StreamCalc,
+    hydroseq   = Hydroseq,
+    levelpathi = LevelPathI,
+    fromnode   = FromNode,
+    tonode     = ToNode,
+    terminalfl = TerminalFl,
+    startflag  = StartFlag,
+    divergence = Divergence
+  ) %>%
   select(comid, reachcode, gnis_name, lengthkm, areasqkm, slope,
          streamorde, streamcalc, hydroseq, levelpathi,
-         fromnode, tonode, terminalfl, startflag, divergence, geometry)
+         fromnode, tonode, terminalfl, startflag, divergence) %>%
+  st_intersection(aoi)
 
+catchments <- hr$NHDPlusCatchment %>%
+  st_as_sf(sf_column_name = "geom") %>%
+  st_transform(4326) %>%
+  st_make_valid() %>%
+  mutate(comid = as.character(FEATUREID)) %>%
+  rename(areasqkm = AreaSqKM) %>%
+  select(comid, areasqkm) %>%
+  st_intersection(aoi)
 ```
 
-```{r}
-# Get Catchments
-catchments <- get_nhdplus(AOI = aoi, realization = "catchment")
-
-# Keep only comid + area
-catchments <- catchments%>%
-  rename(comid = featureid) %>%      # match flowlines naming
-  select(comid, areasqkm, geometry)  # keep only needed field)
-
-```
-
-```{r}
-
-# Check for orphan edges (no fromnode/tonode connection)
-orphan_comids <- flowlines %>%
+```{r orphan-check}
+orphans <- flowlines %>%
   filter(is.na(fromnode) | is.na(tonode)) %>%
   pull(comid)
 
-if (length(orphan_comids) > 0) {
-  warning("Orphan COMIDs found: ", paste(orphan_comids, collapse = ", "))
+if (length(orphans) > 0) {
+  warning("Orphan COMIDs found: ", paste(orphans, collapse = ", "))
 } else {
   message("All COMIDs routable (no orphan edges).")
 }
-
 ```
 
-```{r}
-# Save outputs
+```{r load-qt-and-site-coords}
+q_t <- read_parquet(file.path(daily_drivers_dir, "q_t.parquet")) %>%
+  mutate(Date = as.Date(Date))
 
-flowline_out   <- file.path(nhd_dir, "flowlines.gpkg")
-catchment_out  <- file.path(nhd_dir, "catchments.gpkg")
-daily_drivers_out <- file.path(daily_drivers_dir, "drivers_daily.feather")
-
-# Remove old files if exist
-if (file.exists(flowline_out)) file.remove(flowline_out)
-if (file.exists(catchment_out)) file.remove(catchment_out)
-
-st_write(flowlines, flowline_out, quiet = TRUE)
-st_write(catchments, catchment_out, quiet = TRUE)
-
-```
-
-```{r}
-# Get candidate USGS sites within AOI with Q, T, Chl-a
-
-# AOI
-bbox <- st_bbox(aoi)
-
-site_data <- whatNWISdata(
-  bBox = c(bbox["xmin"], bbox["ymin"], bbox["xmax"], bbox["ymax"]),
-  service = "dv",
-  parameterCd = c("00060", "00010", "32316", "32319")
+site_info <- read_waterdata_monitoring_location(
+  monitoring_location_id = paste0("USGS-", unique(q_t$site_no)),
+  skipGeometry           = FALSE
 )
 
-# Make unique site dataset with metadata
-sites_sf <- site_data %>%
-  filter(!is.na(dec_lat_va), !is.na(dec_long_va)) %>%
-  distinct(site_no, .keep_all = TRUE) %>%   # Keep one record per site
-  st_as_sf(coords = c("dec_long_va", "dec_lat_va"), crs = 4326)
-
+site_coords <- site_info %>%
+  filter(!is.na(geometry)) %>%
+  st_as_sf() %>%
+  st_transform(4326) %>%
+  mutate(site_no = gsub("^USGS-", "", monitoring_location_id))
 ```
 
-```{r}
-# snap sites to nearest flowline
+```{r snap-sites-to-comid}
+# Primary snap: nearest flowline with VAA measures (uses full network so small
+# tributaries don't get misrouted to a mainstem reach).
+vaa <- get_vaa() %>% select(comid, frommeas, tomeas)
 
-# Load flowlines from the file we just created
-flowlines <- st_read(flowline_out, quiet = TRUE)
-
-# Search radius in meters; increase if some sites don't snap
-search_radius <- 100
-
-
-# Add VAA attributes to flowlines before snapping
-vaa <- get_vaa() %>%
-  select(comid, frommeas, tomeas)
-
-# Join to flowlines, rename to what get_flowline_index expects
-flowlines <- flowlines %>%
+flowlines_idx <- flowlines %>%
   left_join(vaa, by = "comid") %>%
   rename(FromMeas = frommeas, ToMeas = tomeas)
 
-# Now run snapping
-site_matches <- get_flowline_index(
-  flowlines,
-  sites_sf,
-  search_radius = search_radius
-)
+site_matches <- get_flowline_index(flowlines_idx, site_coords, search_radius = 100)
 
-# Add COMID to sites dataset
-sites_with_comid <- sites_sf %>%
-  mutate(COMID = site_matches$COMID)
+sites_with_comid <- site_coords %>% mutate(comid = site_matches$COMID)
 
-unsnapped <- sites_with_comid %>% filter(is.na(COMID))
-
+# Fallback: nearest catchment polygon for any site that didn't snap
+unsnapped <- sites_with_comid %>% filter(is.na(comid))
 if (nrow(unsnapped) > 0) {
-  warning("Some sites were not snapped to a COMID: ",
-          paste(unsnapped$site_no, collapse = ", "))
+  message(nrow(unsnapped), " site(s) rescued via nearest-catchment fallback.")
+  rescued <- st_join(
+    st_transform(unsnapped %>% select(site_no), 5070),
+    st_transform(catchments %>% select(comid), 5070),
+    join = st_nearest_feature
+  ) %>%
+    st_drop_geometry() %>%
+    distinct(site_no, comid)
+
+  sites_with_comid <- sites_with_comid %>%
+    st_drop_geometry() %>%
+    select(site_no, comid) %>%
+    rows_update(rescued, by = "site_no")
 } else {
-  message("All sites successfully snapped to COMIDs!")
+  sites_with_comid <- sites_with_comid %>%
+    st_drop_geometry() %>%
+    select(site_no, comid)
 }
 
+write.csv(
+  sites_with_comid,
+  file.path(shape_dir, "sites_with_comid.csv"),
+  row.names = FALSE
+)
+```
 
-sites_out <- file.path(shape_dir, "sites_with_comid.shp")
+```{r join-and-filter-so4}
+# Attach stream order onto Q+T via COMID, then filter Q+T and hydro layers
+# to stream order >= 4 in one consistent pass.
+flow_attrs <- flowlines %>%
+  st_drop_geometry() %>%
+  mutate(comid = as.character(comid)) %>%
+  select(comid, streamorde)
 
-if (file.exists(sites_out)) file.remove(sites_out)
+q_t_comid <- q_t %>%
+  left_join(sites_with_comid, by = "site_no") %>%
+  filter(!is.na(comid)) %>%
+  mutate(comid = as.character(comid)) %>%
+  left_join(flow_attrs, by = "comid") %>%
+  filter(!is.na(streamorde), streamorde >= 4)
 
-st_write(sites_with_comid, sites_out, quiet = TRUE)
+flowlines <- flowlines %>% filter(!is.na(streamorde), streamorde >= 4)
 
+keep_comids <- unique(as.character(flowlines$comid))
+catchments  <- catchments %>%
+  mutate(comid = as.character(comid)) %>%
+  filter(comid %in% keep_comids)
+```
+
+```{r write-final-outputs}
+flowline_out  <- file.path(nhd_dir, "flowlines.gpkg")
+catchment_out <- file.path(nhd_dir, "catchments.gpkg")
+q_t_comid_out <- file.path(daily_drivers_dir, "q_t_comid.parquet")
+
+for (f in c(flowline_out, catchment_out, q_t_comid_out)) {
+  if (file.exists(f)) file.remove(f)
+}
+
+st_write(flowlines,  flowline_out,  quiet = TRUE)
+st_write(catchments, catchment_out, quiet = TRUE)
+write_parquet(q_t_comid, q_t_comid_out)
+
+cat("\nFinal Q+T+COMID (stream order >= 4):\n")
+print(q_t_comid %>% summarise(
+  n_rows          = n(),
+  n_sites         = n_distinct(site_no),
+  n_comids        = n_distinct(comid),
+  min_date        = min(Date, na.rm = TRUE),
+  max_date        = max(Date, na.rm = TRUE),
+  pct_rows_with_Q = mean(!is.na(q_m3s)),
+  pct_rows_with_T = mean(!is.na(water_temp_C))
+))
+```
+
+The following is to assess  
+
+```{r}
+# One row per site with assigned COMID + stream order
+site_stream_order <- q_t %>%
+  distinct(site_no) %>%
+  left_join(sites_with_comid, by = "site_no") %>%
+  filter(!is.na(comid)) %>%
+  mutate(comid = as.character(comid)) %>%
+  left_join(flow_attrs, by = "comid") %>%
+  distinct(site_no, comid, streamorde)
+
+# Quick diagnostic table
+site_stream_order %>%
+  count(streamorde, name = "n_sites") %>%
+  arrange(streamorde) %>%
+  print()
 ```
 
 ```{r}
-# use all catchment COMIDs instead of just site COMIDs
-comids <- sort(unique(na.omit(catchments$comid)))
-if (!length(comids)) stop("No COMIDs available for basin delineation.")
+# Rebuild an sf version of sites with stream order attached
+site_points_map <- site_coords %>%
+  left_join(site_stream_order, by = "site_no")
 
+plot(st_geometry(flowlines),
+     col = "grey70",
+     lwd = 0.4,
+     main = "USGS sites snapped to NHDPlus HR flowlines")
 
-# fetch & bind
-basins <- purrr::map_dfr(comids, function(cid) {
-  res <- get_basin_safe(cid)
-  # tiny pause to be polite to the service; adjust as needed
-  Sys.sleep(0.15)
-  res
-}) %>%
-  st_transform(st_crs(aoi)) %>%
-  st_make_valid()
-
-if (nrow(basins)) {
-  basins_out <- file.path(shape_dir, "site_upstream_basins.gpkg")
-  if (file.exists(basins_out)) file.remove(basins_out)
-  st_write(basins, basins_out, quiet = TRUE)
-  message("Wrote full upstream basins: ", basins_out,
-          " (", length(unique(basins$COMID)), " / ", length(comids), " COMIDs)")
-} else {
-  warning("NLDI returned no basins for the requested COMIDs.")
-}
+plot(st_geometry(site_points_map),
+     col = "red",
+     pch = 16,
+     cex = 0.5,
+     add = TRUE)
 ```
 
 ```{r}
-# Load previously saved flowlines
-flowlines <- st_read(file.path(nhd_dir, "flowlines.gpkg"), quiet = TRUE)
+flowlines_map <- flowlines %>%
+  mutate(
+    so_group = case_when(
+      is.na(streamorde) ~ "NA",
+      streamorde == 1 ~ "1",
+      streamorde == 2 ~ "2",
+      streamorde == 3 ~ "3",
+      streamorde >= 4 ~ "4+"
+    )
+  )
+
+site_points_map <- site_coords %>%
+  left_join(site_stream_order, by = "site_no") %>%
+  mutate(
+    so_group = case_when(
+      is.na(streamorde) ~ "NA",
+      streamorde == 1 ~ "1",
+      streamorde == 2 ~ "2",
+      streamorde == 3 ~ "3",
+      streamorde >= 4 ~ "4+"
+    )
+  )
+
+flow_cols <- c("1" = "#9ecae1", "2" = "#6baed6", "3" = "#3182bd", "4+" = "#08519c", "NA" = "grey80")
+site_cols <- c("1" = "red", "2" = "orange", "3" = "gold", "4+" = "darkgreen", "NA" = "black")
+
+plot(st_geometry(flowlines_map),
+     col = flow_cols[flowlines_map$so_group],
+     lwd = 0.6,
+     main = "Flowlines and USGS sites by assigned stream order")
+
+plot(st_geometry(site_points_map),
+     col = site_cols[site_points_map$so_group],
+     pch = 16,
+     cex = 0.7,
+     add = TRUE)
+
+legend("bottomleft",
+       legend = c("SO 1", "SO 2", "SO 3", "SO 4+"),
+       col = c("red", "orange", "gold", "darkgreen"),
+       pch = 16,
+       bty = "n")
 ```
 

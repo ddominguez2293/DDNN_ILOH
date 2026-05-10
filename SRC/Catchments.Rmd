@@ -106,6 +106,7 @@ if (length(orphans) > 0) {
 ```
 
 ```{r load-qt-and-site-coords}
+# Load Q+T
 q_t <- read_parquet(file.path(daily_drivers_dir, "q_t.parquet")) %>%
   mutate(Date = as.Date(Date))
 
@@ -114,11 +115,20 @@ site_info <- read_waterdata_monitoring_location(
   skipGeometry           = FALSE
 )
 
-site_coords <- site_info %>%
+# Build sf points
+site_coords_all <- site_info %>%
   filter(!is.na(geometry)) %>%
   st_as_sf() %>%
   st_transform(4326) %>%
   mutate(site_no = gsub("^USGS-", "", monitoring_location_id))
+
+# Keep only sites inside the basin polygon
+site_coords <- site_coords_all %>%
+  st_filter(aoi, .predicate = st_intersects)
+
+cat("Total sites returned:", nrow(site_coords_all), "\n")
+cat("Sites inside AOI:", nrow(site_coords), "\n")
+cat("Sites dropped outside AOI:", nrow(site_coords_all) - nrow(site_coords), "\n")
 ```
 
 ```{r snap-sites-to-comid}
@@ -186,6 +196,28 @@ catchments  <- catchments %>%
   filter(comid %in% keep_comids)
 ```
 
+```{r}
+# Stream order breakdown of unique Q and T sensors
+q_sensor_counts <- q_t_comid %>%
+  filter(!is.na(streamorde), !is.na(q_m3s)) %>%
+  distinct(streamorde, site_no) %>%
+  count(streamorde, name = "n_q_sensors") %>%
+  arrange(streamorde)
+
+t_sensor_counts <- q_t_comid %>%
+  filter(!is.na(streamorde), !is.na(water_temp_C)) %>%
+  distinct(streamorde, site_no) %>%
+  count(streamorde, name = "n_t_sensors") %>%
+  arrange(streamorde)
+
+sensor_counts_by_order <- full_join(q_sensor_counts, t_sensor_counts, by = "streamorde") %>%
+  arrange(streamorde)
+
+cat("\nUnique sensors by stream order:\n")
+print(sensor_counts_by_order)
+```
+
+
 ```{r write-final-outputs}
 flowline_out  <- file.path(nhd_dir, "flowlines.gpkg")
 catchment_out <- file.path(nhd_dir, "catchments.gpkg")
@@ -211,7 +243,7 @@ print(q_t_comid %>% summarise(
 ))
 ```
 
-The following is to assess  
+The following is to assess why there are so many stream order 1 sites
 
 ```{r}
 # One row per site with assigned COMID + stream order
@@ -247,48 +279,71 @@ plot(st_geometry(site_points_map),
      add = TRUE)
 ```
 
+
 ```{r}
-flowlines_map <- flowlines %>%
-  mutate(
-    so_group = case_when(
-      is.na(streamorde) ~ "NA",
-      streamorde == 1 ~ "1",
-      streamorde == 2 ~ "2",
-      streamorde == 3 ~ "3",
-      streamorde >= 4 ~ "4+"
-    )
-  )
+sites_so1 <- site_points_map %>%
+  filter(streamorde == 1)
 
-site_points_map <- site_coords %>%
-  left_join(site_stream_order, by = "site_no") %>%
-  mutate(
-    so_group = case_when(
-      is.na(streamorde) ~ "NA",
-      streamorde == 1 ~ "1",
-      streamorde == 2 ~ "2",
-      streamorde == 3 ~ "3",
-      streamorde >= 4 ~ "4+"
-    )
-  )
+flowlines_so1 <- flowlines %>%
+  filter(streamorde == 1)
 
-flow_cols <- c("1" = "#9ecae1", "2" = "#6baed6", "3" = "#3182bd", "4+" = "#08519c", "NA" = "grey80")
-site_cols <- c("1" = "red", "2" = "orange", "3" = "gold", "4+" = "darkgreen", "NA" = "black")
+plot(st_geometry(flowlines),
+     col = "grey85",
+     lwd = 0.3,
+     main = "Sites assigned to stream order 1")
 
-plot(st_geometry(flowlines_map),
-     col = flow_cols[flowlines_map$so_group],
-     lwd = 0.6,
-     main = "Flowlines and USGS sites by assigned stream order")
-
-plot(st_geometry(site_points_map),
-     col = site_cols[site_points_map$so_group],
-     pch = 16,
-     cex = 0.7,
+plot(st_geometry(flowlines_so1),
+     col = "lightblue",
+     lwd = 0.8,
      add = TRUE)
 
-legend("bottomleft",
-       legend = c("SO 1", "SO 2", "SO 3", "SO 4+"),
-       col = c("red", "orange", "gold", "darkgreen"),
-       pch = 16,
-       bty = "n")
+plot(st_geometry(sites_so1),
+     col = "red",
+     pch = 16,
+     cex = 0.8,
+     add = TRUE)
+```
+
+```{r}
+# sf version of snapped site-comid lookup
+sites_with_comid_sf <- site_coords %>%
+  left_join(
+    sites_with_comid %>% mutate(comid = as.character(comid)),
+    by = "site_no"
+  )
+
+flow_centers <- flowlines %>%
+  mutate(comid = as.character(comid))
+
+site_snap_check <- sites_with_comid_sf %>%
+  filter(!is.na(comid)) %>%
+  left_join(
+    flow_centers %>% st_drop_geometry() %>% select(comid, streamorde),
+    by = "comid"
+  )
+
+nearest_line_geom <- flow_centers[match(site_snap_check$comid, flow_centers$comid), ]
+
+snap_dist_m <- st_distance(
+  st_transform(site_snap_check, 5070),
+  st_transform(nearest_line_geom, 5070),
+  by_element = TRUE
+)
+
+site_snap_check <- site_snap_check %>%
+  mutate(snap_dist_m = as.numeric(snap_dist_m))
+
+site_snap_check %>%
+  st_drop_geometry() %>%
+  group_by(streamorde) %>%
+  summarise(
+    n_sites = n(),
+    mean_snap_m = mean(snap_dist_m, na.rm = TRUE),
+    median_snap_m = median(snap_dist_m, na.rm = TRUE),
+    max_snap_m = max(snap_dist_m, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(streamorde) %>%
+  print()
 ```
 

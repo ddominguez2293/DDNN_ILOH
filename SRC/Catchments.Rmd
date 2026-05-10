@@ -105,30 +105,45 @@ if (length(orphans) > 0) {
 }
 ```
 
-```{r load-qt-and-site-coords}
+
+```{r load and snap-sites-to-comid}
+
+# Load Q+T
 # Load Q+T
 q_t <- read_parquet(file.path(daily_drivers_dir, "q_t.parquet")) %>%
   mutate(Date = as.Date(Date))
 
-site_info <- read_waterdata_monitoring_location(
-  monitoring_location_id = paste0("USGS-", unique(q_t$site_no)),
-  skipGeometry           = FALSE
-)
+site_ids <- paste0("USGS-", unique(q_t$site_no))
 
+# Batch into groups of 50
+batch_size <- 50
+batches <- split(site_ids, ceiling(seq_along(site_ids) / batch_size))
+
+site_info_raw <- purrr::map(batches, function(batch) {
+  Sys.sleep(0.5)
+  result <- read_waterdata_monitoring_location(
+    monitoring_location_id = batch,
+    skipGeometry           = FALSE
+  )
+
+  coords <- st_coordinates(result)
+
+  result %>%
+    st_drop_geometry() %>%
+    mutate(
+      across(everything(), as.character),
+      longitude = coords[, 1],
+      latitude  = coords[, 2]
+    )
+})
+
+# Keep only sites within the AOI
 # Build sf points
-site_coords_all <- site_info %>%
-  filter(!is.na(geometry)) %>%
-  st_as_sf() %>%
+site_coords_all <- bind_rows(site_info_raw) %>%
+  filter(!is.na(longitude), !is.na(latitude)) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
   st_transform(4326) %>%
   mutate(site_no = gsub("^USGS-", "", monitoring_location_id))
-
-# Keep only sites inside the basin polygon
-site_coords <- site_coords_all %>%
-  st_filter(aoi, .predicate = st_intersects)
-
-cat("Total sites returned:", nrow(site_coords_all), "\n")
-cat("Sites inside AOI:", nrow(site_coords), "\n")
-cat("Sites dropped outside AOI:", nrow(site_coords_all) - nrow(site_coords), "\n")
 ```
 
 ```{r snap-sites-to-comid}
@@ -137,34 +152,66 @@ cat("Sites dropped outside AOI:", nrow(site_coords_all) - nrow(site_coords), "\n
 vaa <- get_vaa() %>% select(comid, frommeas, tomeas)
 
 flowlines_idx <- flowlines %>%
+  mutate(comid = as.character(comid)) %>%
   left_join(vaa, by = "comid") %>%
-  rename(FromMeas = frommeas, ToMeas = tomeas)
+  rename(
+    FromMeas = frommeas,
+    ToMeas   = tomeas
+  )
 
-site_matches <- get_flowline_index(flowlines_idx, site_coords, search_radius = 100)
+# Snap sites to flowlines
+site_matches <- get_flowline_index(
+  flowlines_idx,
+  site_coords,
+  search_radius = 50
+)
 
-sites_with_comid <- site_coords %>% mutate(comid = site_matches$COMID)
+sites_with_comid_sf <- site_coords %>%
+  mutate(comid = as.character(site_matches$COMID)) %>%
+  filter(!is.na(comid))
 
-# Fallback: nearest catchment polygon for any site that didn't snap
-unsnapped <- sites_with_comid %>% filter(is.na(comid))
-if (nrow(unsnapped) > 0) {
-  message(nrow(unsnapped), " site(s) rescued via nearest-catchment fallback.")
-  rescued <- st_join(
-    st_transform(unsnapped %>% select(site_no), 5070),
-    st_transform(catchments %>% select(comid), 5070),
-    join = st_nearest_feature
+# Compute snap distance from each site to its assigned flowline
+flow_match <- flowlines %>%
+  mutate(comid = as.character(comid))
+
+matched_lines <- flow_match[match(sites_with_comid_sf$comid, flow_match$comid), ]
+
+snap_dist_m <- st_distance(
+  st_transform(sites_with_comid_sf, 5070),
+  st_transform(matched_lines, 5070),
+  by_element = TRUE
+)
+
+sites_with_comid_sf <- sites_with_comid_sf %>%
+  mutate(snap_dist_m = as.numeric(snap_dist_m))
+
+cat("\nSnap distance summary (meters):\n")
+print(summary(sites_with_comid_sf$snap_dist_m))
+
+# Keep only defensible direct matches
+snap_dist_threshold_m <- 250
+
+sites_with_comid_sf <- sites_with_comid_sf %>%
+  filter(snap_dist_m <= snap_dist_threshold_m)
+
+cat("Sites retained after snap-distance filter:", nrow(sites_with_comid_sf), "\n")
+
+# Optional: inspect excluded sites
+sites_excluded_bad_snap <- site_coords %>%
+  left_join(
+    sites_with_comid_sf %>%
+      st_drop_geometry() %>%
+      select(site_no, comid, snap_dist_m),
+    by = "site_no"
   ) %>%
-    st_drop_geometry() %>%
-    distinct(site_no, comid)
+  filter(is.na(comid))
 
-  sites_with_comid <- sites_with_comid %>%
-    st_drop_geometry() %>%
-    select(site_no, comid) %>%
-    rows_update(rescued, by = "site_no")
-} else {
-  sites_with_comid <- sites_with_comid %>%
-    st_drop_geometry() %>%
-    select(site_no, comid)
-}
+cat("Sites excluded for missing/poor COMID match:", nrow(sites_excluded_bad_snap), "\n")
+
+# Final lookup used downstream
+sites_with_comid <- sites_with_comid_sf %>%
+  st_drop_geometry() %>%
+  select(site_no, comid)
 
 write.csv(
   sites_with_comid,
@@ -186,7 +233,23 @@ q_t_comid <- q_t %>%
   filter(!is.na(comid)) %>%
   mutate(comid = as.character(comid)) %>%
   left_join(flow_attrs, by = "comid") %>%
-  filter(!is.na(streamorde), streamorde >= 4)
+  filter(!is.na(streamorde), streamorde >= 4)%>%
+  group_by(site_no) %>%
+  filter(any(!is.na(q_m3s) | !is.na(water_temp_C))) %>%
+  ungroup()
+
+# Unique Q and T sensors by stream order (after SO >= 4 filter)
+sensor_counts_by_order <- q_t_comid %>%
+  group_by(streamorde) %>%
+  summarise(
+    n_q_sensors = n_distinct(site_no[!is.na(q_m3s)]),
+    n_t_sensors = n_distinct(site_no[!is.na(water_temp_C)]),
+    .groups = "drop"
+  ) %>%
+  arrange(streamorde)
+
+cat("\nUnique sensors by stream order:\n")
+print(sensor_counts_by_order)
 
 flowlines <- flowlines %>% filter(!is.na(streamorde), streamorde >= 4)
 
@@ -264,86 +327,35 @@ site_stream_order %>%
 
 ```{r}
 # Rebuild an sf version of sites with stream order attached
+# Sites map, zoomed to AOI
 site_points_map <- site_coords %>%
   left_join(site_stream_order, by = "site_no")
 
-plot(st_geometry(flowlines),
-     col = "grey70",
-     lwd = 0.4,
-     main = "USGS sites snapped to NHDPlus HR flowlines")
+aoi_bbox <- st_bbox(aoi)
 
-plot(st_geometry(site_points_map),
-     col = "red",
-     pch = 16,
-     cex = 0.5,
-     add = TRUE)
-```
+par(mar = c(0.2, 0.2, 0.2, 0.2), xaxs = "i", yaxs = "i")
 
-
-```{r}
-sites_so1 <- site_points_map %>%
-  filter(streamorde == 1)
-
-flowlines_so1 <- flowlines %>%
-  filter(streamorde == 1)
-
-plot(st_geometry(flowlines),
-     col = "grey85",
-     lwd = 0.3,
-     main = "Sites assigned to stream order 1")
-
-plot(st_geometry(flowlines_so1),
-     col = "lightblue",
-     lwd = 0.8,
-     add = TRUE)
-
-plot(st_geometry(sites_so1),
-     col = "red",
-     pch = 16,
-     cex = 0.8,
-     add = TRUE)
-```
-
-```{r}
-# sf version of snapped site-comid lookup
-sites_with_comid_sf <- site_coords %>%
-  left_join(
-    sites_with_comid %>% mutate(comid = as.character(comid)),
-    by = "site_no"
-  )
-
-flow_centers <- flowlines %>%
-  mutate(comid = as.character(comid))
-
-site_snap_check <- sites_with_comid_sf %>%
-  filter(!is.na(comid)) %>%
-  left_join(
-    flow_centers %>% st_drop_geometry() %>% select(comid, streamorde),
-    by = "comid"
-  )
-
-nearest_line_geom <- flow_centers[match(site_snap_check$comid, flow_centers$comid), ]
-
-snap_dist_m <- st_distance(
-  st_transform(site_snap_check, 5070),
-  st_transform(nearest_line_geom, 5070),
-  by_element = TRUE
+plot(
+  st_geometry(aoi),
+  col = "grey95",
+  border = "black",
+  xlim = c(aoi_bbox["xmin"], aoi_bbox["xmax"]),
+  ylim = c(aoi_bbox["ymin"], aoi_bbox["ymax"]),
+  asp  = 1
 )
 
-site_snap_check <- site_snap_check %>%
-  mutate(snap_dist_m = as.numeric(snap_dist_m))
+plot(
+  st_geometry(flowlines),
+  col = "grey70",
+  lwd = 0.4,
+  add = TRUE
+)
 
-site_snap_check %>%
-  st_drop_geometry() %>%
-  group_by(streamorde) %>%
-  summarise(
-    n_sites = n(),
-    mean_snap_m = mean(snap_dist_m, na.rm = TRUE),
-    median_snap_m = median(snap_dist_m, na.rm = TRUE),
-    max_snap_m = max(snap_dist_m, na.rm = TRUE),
-    .groups = "drop"
-  ) %>%
-  arrange(streamorde) %>%
-  print()
+plot(
+  st_geometry(site_points_map),
+  col = "red",
+  pch = 16,
+  cex = 0.35,
+  add = TRUE
+)
 ```
-

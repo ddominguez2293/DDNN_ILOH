@@ -26,13 +26,13 @@ basins <- st_read(basins_path, quiet = TRUE)
 
 ```{r}
 # set time window of interest
-start_date <- "1984-01-01" 
-end_date   <- "2025-09-10"   # adjust as needed
+start_date <- "1984-01-01" #1984-01-01
+end_date   <- "2026-04-01"   # adjust as needed
 
 #set parameters to retrieve
-vars <- c("pr",      # precipitation
-          "tmmx",    # max temp
-          "tmmn",    # min temp
+vars <- c(#"pr",      # precipitation
+          #"tmmx",    # max temp
+          #"tmmn",    # min temp
           "srad",    # solar radiation
           "vs",      # wind speed
           "vpd",     # vapor pressure deficit
